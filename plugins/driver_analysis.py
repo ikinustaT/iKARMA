@@ -1,267 +1,227 @@
 """
 iKARMA Driver Analysis Plugin for Volatility3
-Extends driver enumeration with IOCTL handler extraction and capability analysis
+Analyzes kernel drivers for BYOVD (Bring Your Own Vulnerable Driver) risk indicators
+
+MVP Phase 1: Enumerate kernel drivers from memory dump
 """
 
 import logging
-from typing import List, Tuple, Iterator
+from typing import List
 
-from volatility3.framework import renderers, interfaces, exceptions
+from volatility3.framework import renderers, interfaces
 from volatility3.framework.configuration import requirements
-from volatility3.plugins.windows import modules, driverscan
-
-# Capstone for disassembly
-try:
-    from capstone import *
-    CAPSTONE_AVAILABLE = True
-except ImportError:
-    CAPSTONE_AVAILABLE = False
-    logging.warning("Capstone not available. Disassembly features will be disabled.")
+from volatility3.framework.renderers import format_hints
+from volatility3.plugins.windows import modules
 
 vollog = logging.getLogger(__name__)
 
 
 class DriverAnalysis(interfaces.plugins.PluginInterface):
     """
-    Analyzes Windows kernel drivers with focus on IOCTL handlers
+    iKARMA Driver Analysis Plugin
     
-    This plugin extends basic driver enumeration by:
-    - Extracting MajorFunction dispatch tables
-    - Identifying IOCTL handlers (IRP_MJ_DEVICE_CONTROL)
-    - Disassembling handler code for capability analysis
+    Phase 1 (MVP): Enumerate all kernel drivers (.sys files) from memory
+    Future phases: IOCTL handler analysis, dangerous API detection, risk scoring
     """
     
     _required_framework_version = (2, 0, 0)
+    _version = (1, 0, 0)
     
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
-        """Returns the requirements for this plugin"""
+        """
+        Define plugin requirements.
+        """
         return [
             requirements.ModuleRequirement(
                 name="kernel",
                 description="Windows kernel",
                 architectures=["Intel32", "Intel64"]
             ),
-            requirements.PluginRequirement(
-                name="modules",
-                plugin=modules.Modules,
-                version=(1, 0, 0)
+            requirements.ListRequirement(
+                name="drivers",
+                element_type=str,
+                description="Filter output by driver name (optional)",
+                optional=True
             ),
             requirements.BooleanRequirement(
-                name="disassemble",
-                description="Enable disassembly of IOCTL handlers",
-                default=True,
-                optional=True
-            ),
-            requirements.IntRequirement(
-                name="handler_bytes",
-                description="Number of bytes to extract from handler (default 128)",
-                default=128,
-                optional=True
+                name="debug",
+                description="Enable verbose debug output",
+                optional=True,
+                default=False
             )
         ]
     
-    def _generator(self, data):
+    def _generator(self):
         """
-        Generates output for each analyzed driver
-        
-        Yields tuples of:
-        (driver_name, base_address, size, ioctl_handler, handler_info, risk_score)
+        Main generator function that yields driver information.
+        This is called by Volatility's rendering engine.
         """
-        kernel = self.context.modules[self.config["kernel"]]
-        
-        # Get configuration
-        do_disassemble = self.config.get("disassemble", True)
-        handler_bytes = self.config.get("handler_bytes", 128)
-        
-        if do_disassemble and not CAPSTONE_AVAILABLE:
-            vollog.warning("Disassembly requested but Capstone not available")
-            do_disassemble = False
-        
-        # Enumerate drivers using base Volatility3 modules plugin
-        for driver in modules.Modules.list_modules(
-            self.context,
-            kernel.layer_name,
-            kernel.symbol_table_name
-        ):
+        try:
+            driver_filter = self.config.get("drivers", None)
+            debug_mode = self.config.get("debug", False)
+            
+            if debug_mode:
+                vollog.setLevel(logging.DEBUG)
+            
+            vollog.info("=" * 60)
+            vollog.info("STARTING DRIVER ENUMERATION")
+            vollog.info("=" * 60)
+            
+            # Get the kernel module object
+            kernel = self.context.modules[self.config['kernel']]
+            vollog.info(f"✓ Kernel module obtained: {kernel.symbol_table_name}")
+            vollog.info(f"✓ Layer name: {kernel.layer_name}")
+            
+            # Debug: Check what methods are available on Modules class
+            if debug_mode:
+                vollog.debug(f"Available methods on Modules class: {dir(modules.Modules)}")
+            
+            count = 0
+            driver_count = 0
+            sys_file_count = 0
+            
+            vollog.info("Calling Modules.list_modules()...")
+            vollog.info(f"  - Context: {self.context}")
+            vollog.info(f"  - Kernel module name: {self.config['kernel']}")
+            
+            # CORRECT signature: list_modules(context, kernel_module_name)
+            # The kernel_module_name is the string "kernel" from our config
             try:
-                # Extract basic driver info
-                driver_name = driver.get_name()
-                base_addr = driver.DllBase
-                driver_size = driver.SizeOfImage
-                
-                # Parse DRIVER_OBJECT for this driver
-                driver_obj = self._find_driver_object(kernel, base_addr, driver_name)
-                
-                if driver_obj:
-                    # Extract IOCTL handler (MajorFunction[0x0E])
-                    ioctl_handler = self._get_ioctl_handler(driver_obj)
-                    
-                    if ioctl_handler and ioctl_handler != 0:
-                        # Extract handler code from memory
-                        handler_code = self._read_handler_code(
-                            kernel.layer_name,
-                            ioctl_handler,
-                            handler_bytes
-                        )
-                        
-                        # Analyze handler
-                        if handler_code and do_disassemble:
-                            analysis = self._analyze_handler(
-                                handler_code,
-                                ioctl_handler
-                            )
-                        else:
-                            analysis = "Code unavailable or disassembly disabled"
-                        
-                        # Basic risk scoring (placeholder for Phase 2)
-                        risk = self._calculate_basic_risk(handler_code, analysis)
-                        
-                        yield (
-                            0,
-                            (
-                                format_hints.Hex(base_addr),
-                                driver_name,
-                                format_hints.Hex(driver_size),
-                                format_hints.Hex(ioctl_handler),
-                                str(analysis)[:100],  # Truncate for display
-                                risk
-                            )
-                        )
-                    else:
-                        # No IOCTL handler found
-                        yield (
-                            0,
-                            (
-                                format_hints.Hex(base_addr),
-                                driver_name,
-                                format_hints.Hex(driver_size),
-                                "N/A",
-                                "No IOCTL handler",
-                                "Low"
-                            )
-                        )
+                module_iterator = modules.Modules.list_modules(
+                    self.context,
+                    self.config['kernel']  # This is the string "kernel", not the module object!
+                )
+                vollog.info("✓ Module iterator created successfully")
             except Exception as e:
-                vollog.warning(f"Error analyzing driver {driver_name}: {str(e)}")
-                continue
-    
-    def _find_driver_object(self, kernel, base_addr, driver_name):
-        """
-        Locate DRIVER_OBJECT structure for a given driver
-        
-        TODO Phase 1: Implement proper DRIVER_OBJECT lookup
-        This is a placeholder - you'll need to traverse kernel structures
-        to find the DRIVER_OBJECT associated with this driver module.
-        
-        Approaches:
-        1. Search for DRIVER_OBJECT structures in memory
-        2. Follow object manager namespace (\\Driver\\DriverName)
-        3. Use known driver object addresses if available
-        """
-        # Placeholder - implement in Phase 1
-        return None
-    
-    def _get_ioctl_handler(self, driver_obj):
-        """
-        Extract IOCTL handler address from DRIVER_OBJECT
-        
-        The MajorFunction table is an array of 28 function pointers.
-        IRP_MJ_DEVICE_CONTROL (IOCTL) is at index 0x0E (14).
-        """
-        try:
-            # Access MajorFunction array
-            # Structure: DRIVER_OBJECT.MajorFunction[0x0E]
-            major_functions = driver_obj.MajorFunction
-            ioctl_handler = major_functions[0x0E]  # IRP_MJ_DEVICE_CONTROL
+                vollog.error(f"Failed to create module iterator: {e}")
+                import inspect
+                sig = inspect.signature(modules.Modules.list_modules)
+                vollog.error(f"Expected signature: {sig}")
+                raise
             
-            return int(ioctl_handler)
-        except Exception as e:
-            vollog.debug(f"Failed to extract IOCTL handler: {e}")
-            return None
-    
-    def _read_handler_code(self, layer_name, address, size):
-        """
-        Read handler code from memory
-        
-        Handles errors gracefully (paged out memory, invalid addresses)
-        """
-        try:
-            layer = self.context.layers[layer_name]
-            code_bytes = layer.read(address, size, pad=True)
-            return code_bytes
-        except exceptions.InvalidAddressException:
-            vollog.debug(f"Invalid address when reading handler: 0x{address:x}")
-            return None
-        except Exception as e:
-            vollog.debug(f"Error reading handler code: {e}")
-            return None
-    
-    def _analyze_handler(self, code_bytes, address):
-        """
-        Disassemble and analyze handler code
-        
-        Phase 1: Basic disassembly
-        Phase 2: Pattern matching for dangerous capabilities
-        """
-        if not CAPSTONE_AVAILABLE:
-            return "Capstone not available"
-        
-        try:
-            # Initialize Capstone for x64
-            md = Cs(CS_ARCH_X86, CS_MODE_64)
-            md.detail = True
+            vollog.info("Beginning module iteration...")
             
-            instructions = []
-            for insn in md.disasm(code_bytes, address):
-                instructions.append(f"{insn.mnemonic} {insn.op_str}")
+            # Iterate through all kernel modules
+            for mod in module_iterator:
+                count += 1
                 
-                # Limit output for Phase 1
-                if len(instructions) >= 20:
-                    break
-            
-            if instructions:
-                return f"Disassembled {len(instructions)} instructions"
-            else:
-                return "Failed to disassemble"
+                if debug_mode and count <= 5:
+                    vollog.debug(f"\n{'='*50}")
+                    vollog.debug(f"MODULE #{count}")
+                    vollog.debug(f"Module object type: {type(mod)}")
+                    vollog.debug(f"Module object: {mod}")
                 
+                try:
+                    # Extract basic module information from the kernel structure
+                    base_addr = mod.DllBase
+                    size = mod.SizeOfImage
+                    
+                    if debug_mode and count <= 5:
+                        vollog.debug(f"  ✓ Base address: {hex(base_addr)}")
+                        vollog.debug(f"  ✓ Size: {hex(size)} ({size} bytes)")
+                    
+                    # Get the module name - try BaseDllName first, then FullDllName
+                    driver_name = None
+                    try:
+                        # BaseDllName is a UNICODE_STRING structure
+                        driver_name = mod.BaseDllName.get_string()
+                        if debug_mode and count <= 5:
+                            vollog.debug(f"  ✓ BaseDllName: {driver_name}")
+                    except Exception as e:
+                        if debug_mode and count <= 5:
+                            vollog.debug(f"  ✗ Couldn't get BaseDllName: {e}")
+                        try:
+                            driver_name = mod.FullDllName.get_string()
+                            if debug_mode and count <= 5:
+                                vollog.debug(f"  ✓ FullDllName: {driver_name}")
+                        except Exception as e2:
+                            if debug_mode and count <= 5:
+                                vollog.debug(f"  ✗ Couldn't get FullDllName either: {e2}")
+                            continue
+                    
+                    # Skip if no valid name
+                    if not driver_name:
+                        vollog.debug(f"Module #{count} - empty name, skipping")
+                        continue
+                    
+                    # FILTER 1: Only show .sys files (kernel drivers)
+                    if driver_name.lower().endswith('.sys'):
+                        sys_file_count += 1
+                        if debug_mode:
+                            vollog.debug(f"  ✓ Is .sys file: {driver_name}")
+                    else:
+                        if debug_mode and count <= 10:
+                            vollog.debug(f"  ✗ Not a .sys file: {driver_name}")
+                        continue
+                    
+                    # FILTER 2: Apply user-specified filter if provided
+                    if driver_filter:
+                        if not any(filt.lower() in driver_name.lower() for filt in driver_filter):
+                            if debug_mode:
+                                vollog.debug(f"  ✗ Doesn't match filter: {driver_name}")
+                            continue
+                        else:
+                            if debug_mode:
+                                vollog.debug(f"  ✓ Matches filter!")
+                    
+                    driver_count += 1
+                    vollog.info(f"[{driver_count}] Found driver: {driver_name} at {hex(base_addr)} (size: {hex(size)})")
+                    
+                    # For Phase 1: Just basic enumeration
+                    # Phase 2 will add: IOCTL handler extraction
+                    # Phase 3 will add: Disassembly and API scanning
+                    # Phase 4 will add: Risk scoring
+                    
+                    analysis_result = "Enumerated"
+                    risk_level = "N/A"
+                    
+                    # Yield the row data for this driver
+                    yield (
+                        0,  # Tree depth level (0 = root)
+                        (
+                            format_hints.Hex(base_addr),
+                            driver_name,
+                            format_hints.Hex(size),
+                            analysis_result,
+                            risk_level
+                        )
+                    )
+                    
+                except Exception as e:
+                    vollog.error(f"Error processing module #{count}: {e}")
+                    if debug_mode:
+                        import traceback
+                        traceback.print_exc()
+                    continue
+            
+            vollog.info("=" * 60)
+            vollog.info(f"ENUMERATION COMPLETE")
+            vollog.info(f"Total modules processed: {count}")
+            vollog.info(f".sys files found: {sys_file_count}")
+            vollog.info(f"Drivers yielded (after filters): {driver_count}")
+            vollog.info("=" * 60)
+            
         except Exception as e:
-            return f"Disassembly error: {str(e)}"
-    
-    def _calculate_basic_risk(self, code_bytes, analysis):
-        """
-        Basic risk scoring (placeholder for Phase 2)
-        
-        Phase 2 will implement:
-        - Pattern matching for dangerous APIs
-        - Opcode analysis
-        - Weighted scoring
-        - Confidence levels
-        """
-        if not code_bytes:
-            return "Unknown"
-        
-        # Placeholder logic
-        if "error" in str(analysis).lower():
-            return "Unknown"
-        
-        return "Low"  # Default for Phase 1
+            vollog.error(f"FATAL ERROR in _generator: {e}")
+            import traceback
+            traceback.print_exc()
+            # Re-raise to make it visible
+            raise
     
     def run(self):
-        """Main entry point"""
+        """
+        Entry point for the plugin.
+        Returns a TreeGrid with our column definitions and data.
+        """
+        vollog.info("Plugin run() method called")
         return renderers.TreeGrid(
             [
                 ("Base Address", format_hints.Hex),
                 ("Driver Name", str),
-                ("Size", format_hints.Hex),
-                ("IOCTL Handler", str),
+                ("Size (bytes)", format_hints.Hex),
                 ("Analysis", str),
-                ("Risk", str)
+                ("Risk Level", str)
             ],
-            self._generator(
-                self.config
-            )
+            self._generator()
         )
-
-
-# Import format_hints at module level
-from volatility3.framework.renderers import format_hints
