@@ -134,6 +134,10 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
         vollog.info("=" * 80)
         vollog.info("iKARMA Driver Analysis - MVP Phase 1")
         vollog.info("=" * 80)
+        try:
+            import capstone
+        except Exception:
+            capstone = None
 
         try:
             # Get the kernel module object
@@ -304,6 +308,67 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
             import traceback
             vollog.error(traceback.format_exc())
             raise
+
+    def disassemble_function(self, layer_name: str, address: int, size: int = 0x1000, max_instructions: int = 30):
+        """
+        Read memory from the given layer and address, then disassemble using Capstone.
+
+        Returns a list of human-readable instruction strings (up to max_instructions).
+        If Capstone is not available, returns None.
+        """
+        try:
+            # Local import so plugin still loads if capstone is missing
+            from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+        except Exception:
+            vollog.warning("Capstone not available: disassembly will be skipped")
+            return None
+
+        try:
+            layer = self.context.layers[layer_name]
+            data = layer.read(address, size, pad=True)
+        except Exception as e:
+            vollog.error(f"Failed to read memory at {hex(address)}: {e}")
+            return None
+
+        # Try 64-bit first, fall back to 32-bit if needed
+        instructions = []
+        for mode in (CS_MODE_64, ):  # keep single-mode to reduce false assumptions; expand later if needed
+            try:
+                cs = Cs(CS_ARCH_X86, mode)
+                cs.detail = False
+                for i, ins in enumerate(cs.disasm(data, address)):
+                    instructions.append(f"{hex(ins.address)}:\t{ins.mnemonic}\t{ins.op_str}")
+                    if i + 1 >= max_instructions:
+                        break
+                if instructions:
+                    return instructions
+            except Exception:
+                continue
+
+        # If we reach here, disassembly failed or returned nothing
+        return None
+
+    def analyze_for_apis(self, disassembly_lines):
+        """
+        Placeholder that will call the API scanner module. For now returns an empty list.
+
+        Expected input: list of disassembled instruction strings.
+        Expected output: list of found API descriptors (name, address, reason)
+        """
+        # Future: from utils.api_scanner import find_dangerous_apis
+        # return find_dangerous_apis(disassembly_lines)
+        return []
+
+    def calculate_risk(self, found_apis_list):
+        """
+        Placeholder risk calculation function.
+
+        Expected input: list returned from analyze_for_apis
+        Expected output: dict with keys: score (int), level (str), reasons (list)
+        """
+        # Future: from core.risk_scorer import calculate_risk
+        # return calculate_risk(found_apis_list)
+        return {"score": 0, "level": "N/A", "reasons": []}
 
     def run(self):
         """Entry point for the plugin."""
