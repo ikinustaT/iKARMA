@@ -6,7 +6,12 @@ FIXED: Using correct DriverScan.scan_drivers() - it needs context + kernel_modul
 """
 
 import logging
+import sys
+from pathlib import Path
 from typing import List, Dict
+
+# Add parent directory to path for iKARMA module imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from volatility3.framework import renderers, interfaces, exceptions
 from volatility3.framework.configuration import requirements
@@ -350,14 +355,17 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
 
     def analyze_for_apis(self, disassembly_lines):
         """
-        Placeholder that will call the API scanner module. For now returns an empty list.
+        Analyzes disassembled code for dangerous API calls using the API scanner module.
 
         Expected input: list of disassembled instruction strings.
-        Expected output: list of found API descriptors (name, address, reason)
+        Expected output: list of found API descriptors (name, address, reason, risk, etc.)
         """
-        # Future: from utils.api_scanner import find_dangerous_apis
-        # return find_dangerous_apis(disassembly_lines)
-        return []
+        try:
+            from utils.api_scanner import find_dangerous_apis
+            return find_dangerous_apis(disassembly_lines)
+        except Exception as e:
+            vollog.warning(f"API scanner not available or failed: {e}")
+            return []
 
     def calculate_risk(self, found_apis_list):
         """
