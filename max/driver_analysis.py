@@ -6,12 +6,19 @@ FIXED: Using correct DriverScan.scan_drivers() - it needs context + kernel_modul
 """
 
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 from volatility3.framework import renderers, interfaces, exceptions
 from volatility3.framework.configuration import requirements
 from volatility3.framework.renderers import format_hints
 from volatility3.plugins.windows import modules, driverscan
+
+# Optional disassembly support
+try:
+    import capstone
+    HAS_CAPSTONE = True
+except Exception:
+    HAS_CAPSTONE = False
 
 vollog = logging.getLogger(__name__)
 
@@ -152,7 +159,21 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
 
         return False
 
-    def _score_driver(self, normalized_name: str, analysis_result: str, ioctl_handler_display: str, size: int) -> str:
+    # Small database of expected sizes for some common system drivers (approximate)
+    _EXPECTED_DRIVER_SIZES = {
+        # name: expected_size (bytes) -- approximate reference values
+        "tcpip": 0x2db000,
+        "ntfs": 0x28d000,
+        "ntoskrnl": 0x400000,
+        "wdfldr": 0xd1000,
+        "vboxguest": 0x5f000,
+    }
+
+    def _score_driver(self, normalized_name: str, analysis_result: str, ioctl_handler_display: str,
+                      size: int, handler_addr: Optional[int] = None,
+                      module_name: Optional[str] = None, driver_obj_name: Optional[str] = None,
+                      module_ranges: Optional[List[Tuple[int, int, str]]] = None,
+                      layer_name: Optional[str] = None) -> str:
         """Compute a simple, explainable risk score and label for a driver.
 
         Returns a compact string like: "Medium (45%)". Also logs reasons at debug level.
@@ -194,6 +215,88 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
             # already awarded Generic points above; slightly reduce risk
             score -= 3
             reasons.append("Generic handler outside module -3")
+
+        # --- Phase 1.5: Anti-rename detection -------------------------------
+        try:
+            if driver_obj_name and module_name:
+                # Normalize both
+                obj_short = driver_obj_name.lower().split('\\')[-1].replace('.sys', '')
+                mod_short = module_name.lower().replace('.sys', '').split('\\')[-1]
+
+                if obj_short != mod_short:
+                    # Names diverged; potential rename/spoof
+                    score += 20
+                    reasons.append("Name mismatch (renamed?) +20")
+
+                    # If the driver was in the system whitelist, block applying whitelist reduction
+                    if self._is_system_driver(obj_short):
+                        reasons.append("Whitelist override due to mismatch")
+        except Exception:
+            pass
+
+        # --- Size anomaly (compare expected sizes when available) ----------
+        try:
+            if normalized_name in self._EXPECTED_DRIVER_SIZES:
+                expected = self._EXPECTED_DRIVER_SIZES[normalized_name]
+                # Flag if differs by >30%
+                if size and abs(size - expected) > (expected * 0.30):
+                    score += 15
+                    reasons.append("Size anomaly vs expected +15")
+        except Exception:
+            pass
+
+        # --- Handler address anomaly: handler not inside any known module ---
+        try:
+            if handler_addr and module_ranges is not None:
+                in_some_module = False
+                for (mstart, mend, mname) in module_ranges:
+                    if mstart <= handler_addr < mend:
+                        in_some_module = True
+                        break
+
+                if not in_some_module:
+                    # Handler points to unmapped or injected memory
+                    score += 15
+                    reasons.append("Handler in unexpected memory +15")
+        except Exception:
+            pass
+
+        # --- Basic Capstone-based signals (optional) ------------------------
+        try:
+            if HAS_CAPSTONE and handler_addr and layer_name:
+                # Attempt to read and disassemble a small window at handler_addr
+                layer = self.context.layers[layer_name]
+                max_read = 0x800
+                raw = None
+                try:
+                    raw = layer.read(handler_addr, max_read, pad=True)
+                except Exception:
+                    raw = None
+
+                if raw:
+                    # Determine mode based on kernel architecture (assume 64-bit by default)
+                    mode = capstone.CS_MODE_64
+                    md = capstone.Cs(capstone.CS_ARCH_X86, mode)
+                    call_count = 0
+                    rep_movs = 0
+                    instr_count = 0
+                    for ins in md.disasm(raw, handler_addr):
+                        instr_count += 1
+                        mnem = ins.mnemonic.lower()
+                        op = ins.op_str.lower()
+                        if mnem == 'call':
+                            call_count += 1
+                        if 'rep' in mnem or 'rep' in op or 'movs' in mnem or 'movs' in op:
+                            rep_movs += 1
+
+                    if call_count > 8:
+                        score += 10
+                        reasons.append(f"High call density +10 (calls={call_count})")
+                    if rep_movs > 2:
+                        score += 12
+                        reasons.append(f"REP/MOV patterns +12 (rep_movs={rep_movs})")
+        except Exception:
+            pass
 
         # Normalize, clamp
         score = max(0, min(100, int(score)))
@@ -259,8 +362,26 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                 self.config['kernel']
             )
 
+            # Materialize module list and build quick module ranges for handler checks
+            module_list = list(module_iterator)
+            module_ranges: List[Tuple[int, int, str]] = []
+            for m in module_list:
+                try:
+                    mstart = int(m.DllBase)
+                    mend = mstart + int(m.SizeOfImage)
+                    try:
+                        mname = m.BaseDllName.get_string()
+                    except Exception:
+                        try:
+                            mname = m.FullDllName.get_string()
+                        except Exception:
+                            mname = ""
+                    module_ranges.append((mstart, mend, mname or ""))
+                except Exception:
+                    continue
+
             # Iterate through all kernel modules
-            for mod in module_iterator:
+            for mod in module_list:
                 count += 1
 
                 try:
@@ -310,6 +431,9 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
 
                     # Look up the DRIVER_OBJECT by normalized name
                     driver_obj = driver_object_map.get(driver_name_normalized)
+
+                    # Prepare handler address placeholder
+                    handler_int = None
 
                     if driver_obj:
                         if debug_mode and driver_count <= 10:
@@ -361,9 +485,27 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                         if debug_mode and driver_count <= 10:
                             vollog.info(f"  ✗ No DRIVER_OBJECT match for '{driver_name_normalized}'")
 
-                    # Compute risk level using the checklist/scorer
+                    # Determine DRIVER_OBJECT reported name (if available)
+                    driver_obj_name = None
+                    if driver_obj:
+                        try:
+                            driver_obj_name = driver_obj.DriverName.get_string()
+                        except Exception:
+                            driver_obj_name = None
+
+                    # Compute risk level using the checklist/scorer (pass additional context)
                     try:
-                        risk_level = self._score_driver(driver_name_normalized, analysis_result, ioctl_handler_display, size)
+                        risk_level = self._score_driver(
+                            driver_name_normalized,
+                            analysis_result,
+                            ioctl_handler_display,
+                            size,
+                            handler_addr=handler_int,
+                            module_name=driver_name,
+                            driver_obj_name=driver_obj_name,
+                            module_ranges=module_ranges,
+                            layer_name=kernel.layer_name,
+                        )
                     except Exception:
                         risk_level = "N/A"
 
