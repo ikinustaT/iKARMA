@@ -173,10 +173,10 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                       size: int, handler_addr: Optional[int] = None,
                       module_name: Optional[str] = None, driver_obj_name: Optional[str] = None,
                       module_ranges: Optional[List[Tuple[int, int, str]]] = None,
-                      layer_name: Optional[str] = None) -> str:
+                      layer_name: Optional[str] = None) -> Tuple[str, str, int]:
         """Compute a simple, explainable risk score and label for a driver.
 
-        Returns a compact string like: "Medium (45%)". Also logs reasons at debug level.
+        Returns a tuple: (label_string, reasons_string). Example: ("Medium (45%)", "Custom IOCTL +40; Large module +10").
         """
         score = 0
         reasons = []
@@ -309,12 +309,18 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
         else:
             label = "High"
 
-        # Build final string and log debug explanation
+        # Build final string and reasons string, then log debug explanation
         result_str = f"{label} ({score}%)"
-        if self.config.get("debug", False):
-            vollog.debug(f"Scoring: {normalized_name} -> {result_str}; reasons={reasons}")
+        reasons_str = "; ".join(reasons) if reasons else ""
+        # Trim very long explanations for display purposes
+        MAX_REASON_LEN = 180
+        if len(reasons_str) > MAX_REASON_LEN:
+            reasons_str = reasons_str[:MAX_REASON_LEN].rstrip() + "..."
 
-        return result_str
+        if self.config.get("debug", False):
+            vollog.debug(f"Scoring: {normalized_name} -> {result_str}; reasons={reasons_str}")
+
+        return result_str, reasons_str, score
 
 
     def _generator(self):
@@ -495,7 +501,7 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
 
                     # Compute risk level using the checklist/scorer (pass additional context)
                     try:
-                        risk_level = self._score_driver(
+                        risk_level, score_details, score_num = self._score_driver(
                             driver_name_normalized,
                             analysis_result,
                             ioctl_handler_display,
@@ -508,8 +514,10 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                         )
                     except Exception:
                         risk_level = "N/A"
+                        score_details = ""
+                        score_num = 0
 
-                    # Yield result
+                    # Yield result (include explainable Score Details)
                     yield (
                         0,
                         (
@@ -518,7 +526,9 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                             format_hints.Hex(size),
                             ioctl_handler_display,
                             analysis_result,
-                            risk_level
+                            score_num,
+                            risk_level,
+                            score_details,
                         )
                     )
 
@@ -557,7 +567,9 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                 ("Size (bytes)", format_hints.Hex),
                 ("IOCTL Handler", str),
                 ("Analysis", str),
-                ("Risk Level", str)
+                ("Score", int),
+                ("Risk Level", str),
+                ("Score Details", str)
             ],
             self._generator()
         )
