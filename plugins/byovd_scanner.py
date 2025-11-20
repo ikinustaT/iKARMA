@@ -410,7 +410,10 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                                 module_name=driver_name,
                                 driver_obj_name=driver_obj_name,
                                 module_ranges=module_ranges,
-                                found_apis=found_apis
+                                found_apis=found_apis,
+                                disasm_lines=disasm,  # Pass pre-disassembled lines
+                                context_layers=self.context.layers,  # Pass layer dict for Capstone
+                                layer_name=kernel.layer_name  # Pass layer name
                             )
                             risk_level = risk_result['level']
                             score_details = risk_result['reasons']

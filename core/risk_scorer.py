@@ -14,10 +14,17 @@ risk scores (0-100) to kernel drivers based on multiple indicators:
 8. Disassembly pattern analysis (optional)
 
 Author: Person 3 (Risk Analyst) with Person 1 integration
-Last Updated: 2025-11-19
+Last Updated: 2025-11-21
 """
 
 from typing import List, Dict, Tuple, Optional
+
+# Optional disassembly support
+try:
+    import capstone
+    HAS_CAPSTONE = True
+except Exception:
+    HAS_CAPSTONE = False
 
 
 # ============================================================================
@@ -159,6 +166,95 @@ def detect_name_mismatch(driver_obj_name: Optional[str],
     return obj_short != mod_short
 
 
+def analyze_disassembly_patterns(disasm_lines: Optional[List[str]]) -> Tuple[int, int]:
+    """
+    Analyze disassembly patterns for suspicious code behavior.
+    
+    Args:
+        disasm_lines: List of disassembly instruction strings (e.g., ["mov rax, rbx", "call qword [...]"])
+        
+    Returns:
+        Tuple of (call_count, rep_movs_count)
+    """
+    call_count = 0
+    rep_movs_count = 0
+    
+    if not disasm_lines:
+        return 0, 0
+    
+    try:
+        for line in disasm_lines:
+            if not isinstance(line, str):
+                continue
+                
+            line_lower = line.lower()
+            
+            # Count CALL instructions
+            if '\tcall' in line_lower or ' call ' in line_lower:
+                call_count += 1
+            
+            # Count REP/MOV patterns (bulk memory copy, common exploit vector)
+            if 'rep' in line_lower or 'movs' in line_lower:
+                rep_movs_count += 1
+    except Exception:
+        pass
+    
+    return call_count, rep_movs_count
+
+
+def detect_capstone_anomalies(handler_addr: Optional[int], 
+                             layer_name: Optional[str],
+                             context_layers: Optional[Dict] = None) -> Tuple[int, int]:
+    """
+    Detect suspicious disassembly patterns using Capstone.
+    
+    Args:
+        handler_addr: IOCTL handler address
+        layer_name: Memory layer name
+        context_layers: Dict of available memory layers (from Volatility context)
+        
+    Returns:
+        Tuple of (call_count, rep_movs_count)
+    """
+    if not HAS_CAPSTONE or not handler_addr or not layer_name or not context_layers:
+        return 0, 0
+    
+    try:
+        layer = context_layers.get(layer_name)
+        if not layer:
+            return 0, 0
+        
+        # Read a small window of code at handler
+        max_read = 0x800
+        try:
+            raw = layer.read(handler_addr, max_read, pad=True)
+        except Exception:
+            return 0, 0
+        
+        if not raw:
+            return 0, 0
+        
+        # Disassemble (assume 64-bit x86)
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        call_count = 0
+        rep_movs_count = 0
+        
+        for ins in md.disasm(raw, handler_addr):
+            mnem = ins.mnemonic.lower()
+            op_str = ins.op_str.lower()
+            
+            if mnem == 'call':
+                call_count += 1
+            
+            if 'rep' in mnem or 'movs' in mnem or 'rep' in op_str or 'movs' in op_str:
+                rep_movs_count += 1
+        
+        return call_count, rep_movs_count
+        
+    except Exception:
+        return 0, 0
+
+
 # ============================================================================
 # MAIN RISK SCORING FUNCTION
 # ============================================================================
@@ -172,7 +268,10 @@ def calculate_driver_risk(
     module_name: Optional[str] = None,
     driver_obj_name: Optional[str] = None,
     module_ranges: Optional[List[Tuple[int, int, str]]] = None,
-    found_apis: Optional[List[Dict]] = None
+    found_apis: Optional[List[Dict]] = None,
+    disasm_lines: Optional[List[str]] = None,
+    context_layers: Optional[Dict] = None,
+    layer_name: Optional[str] = None
 ) -> Dict[str, any]:
     """
     Compute explainable risk score for a kernel driver.
@@ -187,6 +286,9 @@ def calculate_driver_risk(
         driver_obj_name: Name from DRIVER_OBJECT (optional)
         module_ranges: List of (start, end, name) for all modules (optional)
         found_apis: List of dangerous APIs detected by Person 2's scanner (optional)
+        disasm_lines: Pre-disassembled instruction strings (optional)
+        context_layers: Dict of memory layers for dynamic disassembly (optional)
+        layer_name: Memory layer name for Capstone disassembly (optional)
         
     Returns:
         Dict with keys:
@@ -288,6 +390,39 @@ def calculate_driver_risk(
     if isinstance(ioctl_handler_display, str) and ioctl_handler_display.startswith("Generic"):
         score -= 3
         reasons.append("Generic handler (lower risk) -3")
+    
+    # ========================================================================
+    # FACTOR 9: Disassembly Pattern Analysis – High Call Density (+10)
+    # ========================================================================
+    try:
+        call_count = 0
+        rep_movs_count = 0
+        
+        # Method 1: Use pre-disassembled lines (from caller)
+        if disasm_lines:
+            call_count, rep_movs_count = analyze_disassembly_patterns(disasm_lines)
+        # Method 2: Dynamic disassembly using Capstone
+        elif HAS_CAPSTONE and handler_addr and context_layers and layer_name:
+            call_count, rep_movs_count = detect_capstone_anomalies(
+                handler_addr, layer_name, context_layers
+            )
+        
+        if call_count > 8:
+            score += 10
+            reasons.append(f"High call density +10 (calls={call_count})")
+    except Exception:
+        pass
+    
+    # ========================================================================
+    # FACTOR 10: Disassembly Pattern Analysis – REP/MOV Patterns (+12)
+    # ========================================================================
+    try:
+        # Call count and rep_movs already computed above
+        if rep_movs_count > 2:
+            score += 12
+            reasons.append(f"REP/MOV patterns +12 (patterns={rep_movs_count})")
+    except Exception:
+        pass
     
     # ========================================================================
     # Normalize and Clamp Score
