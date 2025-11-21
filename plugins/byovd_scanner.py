@@ -39,10 +39,10 @@ find_dangerous_apis = None
 calculate_driver_risk = None
 
 try:
-    # Add the plugin directory to path (where core/ and utils/ are located)
-    plugin_dir = str(Path(__file__).parent)
-    if plugin_dir not in sys.path:
-        sys.path.insert(0, plugin_dir)
+    # Add the iKARMA root directory to path (core/ and utils/ are there)
+    ikarma_root = str(Path(__file__).parent)
+    if ikarma_root not in sys.path:
+        sys.path.insert(0, ikarma_root)
     
     from utils.api_scanner import find_dangerous_apis
     from core.risk_scorer import calculate_driver_risk
@@ -91,11 +91,11 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                 optional=True,
                 default=False
             ),
-            requirements.BooleanRequirement(
-                name="high-risk-only",
-                description="Only show high-risk drivers (score >= 70)",
+            requirements.StringRequirement(
+                name="tier",
+                description="Filter level: all, medium (40+), high (70+), critical (90+)",
                 optional=True,
-                default=False
+                default="all"
             ),
             requirements.StringRequirement(
                 name="export-json",
@@ -212,7 +212,7 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
         """
         driver_filter = self.config.get("drivers", None)
         debug_mode = self.config.get("debug", False)
-        high_risk_only = self.config.get("high-risk-only", False)
+        tier_mode = self.config.get("tier", "all").lower()
         detailed_mode = self.config.get("detailed", False)
         export_json_path = self.config.get("export-json", None)
 
@@ -271,6 +271,8 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
             # Materialize module list and build module ranges for validation
             module_list = list(module_iterator)
             module_ranges: List[Tuple[int, int, str]] = []
+            all_load_times: List[int] = []  # Collect all load times for temporal analysis
+            
             for m in module_list:
                 try:
                     mstart = int(m.DllBase)
@@ -283,8 +285,20 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                         except Exception:
                             mname = ""
                     module_ranges.append((mstart, mend, mname or ""))
+                    
+                    # Collect load time for temporal analysis
+                    try:
+                        if hasattr(m, 'LoadTime'):
+                            lt = m.LoadTime
+                            if lt and lt > 0:
+                                all_load_times.append(lt)
+                    except:
+                        pass
                 except Exception:
                     continue
+            
+            if debug_mode:
+                vollog.info(f"Collected {len(all_load_times)} load times for temporal analysis")
 
             # Iterate through all kernel modules
             for mod in module_list:
@@ -307,6 +321,27 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
 
                     if not driver_name:
                         continue
+                    
+                    # Extract load time (if available)
+                    load_time = None
+                    load_time_str = "Unknown"
+                    try:
+                        # Try to get LoadTime from _LDR_DATA_TABLE_ENTRY
+                        if hasattr(mod, 'LoadTime'):
+                            load_time = mod.LoadTime
+                            # Convert Windows FILETIME to readable format
+                            if load_time and load_time != 0:
+                                import datetime
+                                # Windows FILETIME: 100-nanosecond intervals since 1601-01-01
+                                timestamp = (load_time - 116444736000000000) / 10000000
+                                load_time_dt = datetime.datetime.utcfromtimestamp(timestamp)
+                                load_time_str = load_time_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        
+                        if debug_mode and driver_count <= 5:
+                            vollog.info(f"  Load time: {load_time_str}")
+                    except Exception as e:
+                        if debug_mode:
+                            vollog.debug(f"  Could not extract load time: {e}")
 
                     # FILTER 1: Only .sys files (kernel drivers)
                     if not driver_name.lower().endswith('.sys'):
@@ -413,32 +448,62 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                                 found_apis=found_apis,
                                 disasm_lines=disasm,  # Pass pre-disassembled lines
                                 context_layers=self.context.layers,  # Pass layer dict for Capstone
-                                layer_name=kernel.layer_name  # Pass layer name
+                                layer_name=kernel.layer_name,  # Pass layer name
+                                load_time=load_time,  # 🆕 TEMPORAL: Driver load timestamp
+                                all_load_times=all_load_times  # 🆕 TEMPORAL: All driver load times for comparison
                             )
                             risk_level = risk_result['level']
                             score_details = risk_result['reasons']
                             score_num = risk_result['score']
+                            confidence = risk_result.get('confidence', 0.0)
+                            confidence_reasons = risk_result.get('confidence_reasons', '')
                         else:
                             # Fallback basic scoring
                             score_num = 40 if analysis_result == "Custom IOCTL" else 10 if analysis_result == "Generic IOCTL" else 0
                             risk_level = "High" if score_num >= 70 else "Medium" if score_num >= 30 else "Low"
                             score_details = f"{analysis_result}"
+                            confidence = 0.5
+                            confidence_reasons = "Basic scoring (no iKARMA modules)"
                     except Exception as e:
                         if debug_mode:
                             vollog.error(f"Risk scoring failed: {e}")
                         risk_level = "N/A"
                         score_details = ""
                         score_num = 0
+                        confidence = 0.0
+                        confidence_reasons = "Scoring error"
 
-                    # FILTER 3: High-risk only mode
-                    if high_risk_only and score_num < 70:
+                    # FILTER 3: Tier-based filtering
+                    if tier_mode == "critical" and score_num < 90:
                         continue
+                    elif tier_mode == "high" and score_num < 70:
+                        continue
+                    elif tier_mode == "medium" and score_num < 40:
+                        continue
+                    # "all" shows everything
 
-                    # Build API summary for detailed mode
-                    api_summary = ""
-                    if detailed_mode and found_apis:
-                        api_names = [api['name'] for api in found_apis[:3]]
-                        api_summary = f" [{', '.join(api_names)}{'...' if len(found_apis) > 3 else ''}]"
+                    # Format output fields
+                    
+                    # Risk display: "High (75)"
+                    risk_display = f"{risk_level} ({score_num})"
+                    
+                    # Confidence display: "87%" or "N/A"
+                    confidence_display = f"{int(confidence * 100)}%" if confidence > 0 else "N/A"
+                    
+                    # APIs display: "3 APIs" or specific names in detailed mode
+                    if found_apis:
+                        if detailed_mode:
+                            api_names = [api['name'] for api in found_apis[:2]]
+                            apis_display = ', '.join(api_names)
+                            if len(found_apis) > 2:
+                                apis_display += f" (+{len(found_apis)-2})"
+                        else:
+                            apis_display = f"{len(found_apis)} APIs"
+                    else:
+                        apis_display = "-"
+                    
+                    # Evidence: Shortened reasons (max 80 chars for readability)
+                    evidence = score_details[:80] + "..." if len(score_details) > 80 else score_details
 
                     # JSON export accumulation
                     if export_json_path:
@@ -450,22 +515,22 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                             'analysis': analysis_result,
                             'score': score_num,
                             'risk_level': risk_level,
+                            'confidence': confidence,
                             'score_details': score_details,
                             'found_apis': found_apis if found_apis else []
                         })
 
-                    # Yield result
+                    # Yield result with new column order
                     yield (
                         0,
                         (
-                            format_hints.Hex(base_addr),
                             driver_name,
-                            format_hints.Hex(size),
+                            risk_display,
+                            confidence_display,
+                            apis_display,
                             ioctl_handler_display,
-                            analysis_result,
-                            score_num,
-                            risk_level,
-                            score_details + api_summary
+                            format_hints.Hex(base_addr),
+                            evidence
                         )
                     )
 
@@ -520,14 +585,13 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
         """Entry point for the plugin."""
         return renderers.TreeGrid(
             [
-                ("Base Address", format_hints.Hex),
                 ("Driver Name", str),
-                ("Size (bytes)", format_hints.Hex),
+                ("Risk", str),  # Combines level + score
+                ("Confidence", str),  # Percentage
+                ("APIs", str),  # Count or names
                 ("IOCTL Handler", str),
-                ("Analysis", str),
-                ("Score", int),
-                ("Risk Level", str),
-                ("Score Details", str)
+                ("Base Address", format_hints.Hex),
+                ("Evidence", str)  # Shortened reasons
             ],
             self._generator()
         )

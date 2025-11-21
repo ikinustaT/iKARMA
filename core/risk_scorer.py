@@ -271,7 +271,9 @@ def calculate_driver_risk(
     found_apis: Optional[List[Dict]] = None,
     disasm_lines: Optional[List[str]] = None,
     context_layers: Optional[Dict] = None,
-    layer_name: Optional[str] = None
+    layer_name: Optional[str] = None,
+    load_time: Optional[int] = None,
+    all_load_times: Optional[List[int]] = None
 ) -> Dict[str, any]:
     """
     Compute explainable risk score for a kernel driver.
@@ -425,6 +427,43 @@ def calculate_driver_risk(
         pass
     
     # ========================================================================
+    # FACTOR 11: Temporal Anomaly Detection (BYOVD Key Indicator, +20 to +35)
+    # ========================================================================
+    try:
+        if load_time and all_load_times and len(all_load_times) > 5:
+            # Sort all load times to find boot window
+            sorted_times = sorted([t for t in all_load_times if t and t > 0])
+            
+            if len(sorted_times) >= 5:
+                # Boot window: time range when most drivers loaded
+                # Typically first 50 drivers load within ~30 seconds of boot
+                boot_window_end = sorted_times[min(50, len(sorted_times) - 1)]
+                
+                # Check if this driver loaded significantly after boot
+                if load_time > boot_window_end:
+                    time_diff = load_time - boot_window_end
+                    
+                    # Convert to seconds (Windows FILETIME is 100-nanosecond intervals)
+                    time_diff_seconds = time_diff / 10000000
+                    
+                    if time_diff_seconds > 3600:  # > 1 hour after boot window
+                        score += 35
+                        hours = int(time_diff_seconds / 3600)
+                        reasons.append(f"Loaded {hours}h after boot +35 (BYOVD indicator)")
+                    elif time_diff_seconds > 600:  # > 10 minutes after boot window
+                        score += 20
+                        mins = int(time_diff_seconds / 60)
+                        reasons.append(f"Loaded {mins}m after boot +20")
+                
+                # Additional check: Is this the ONLY recent driver?
+                recent_drivers = sum(1 for t in sorted_times if abs(t - load_time) < 600 * 10000000)  # Within 10 min
+                if recent_drivers == 1 and load_time > boot_window_end:
+                    score += 15
+                    reasons.append("Only recent driver +15 (isolated load)")
+    except Exception:
+        pass
+    
+    # ========================================================================
     # Normalize and Clamp Score
     # ========================================================================
     score = max(0, min(100, int(score)))
@@ -451,17 +490,100 @@ def calculate_driver_risk(
     if len(reasons_str) > MAX_REASON_LEN:
         reasons_str = reasons_str[:MAX_REASON_LEN].rstrip() + "..."
     
+    # ========================================================================
+    # Calculate Confidence Score
+    # ========================================================================
+    confidence, confidence_reasons = calculate_confidence_score(
+        found_apis=found_apis,
+        analysis_result=analysis_result,
+        handler_addr=handler_addr,
+        driver_obj_name=driver_obj_name,
+        module_name=module_name
+    )
+    
     return {
         'score': score,
         'level': level,
         'reasons': reasons_str,
-        'confidence': 0.0  # Placeholder for Person 3's confidence framework
+        'confidence': confidence,
+        'confidence_reasons': confidence_reasons
     }
 
 
 # ============================================================================
-# CONFIDENCE FRAMEWORK (Future: Person 3's advanced work)
+# CONFIDENCE FRAMEWORK (Person 3's work)
 # ============================================================================
+
+def calculate_confidence_score(
+    found_apis: Optional[List[Dict]] = None,
+    analysis_result: str = "Enumerated",
+    handler_addr: Optional[int] = None,
+    driver_obj_name: Optional[str] = None,
+    module_name: Optional[str] = None
+) -> Tuple[float, str]:
+    """
+    Calculate confidence in risk assessment (0.0 - 1.0).
+    
+    High confidence (0.8-1.0): Multiple strong indicators
+    Medium confidence (0.5-0.79): Some evidence
+    Low confidence (0.0-0.49): Heuristics only
+    
+    Returns:
+        Tuple of (confidence_score, explanation)
+    """
+    confidence = 0.0
+    reasons = []
+    
+    # Factor 1: API Detection (+0.4 max)
+    if found_apis and len(found_apis) > 0:
+        high_risk_apis = sum(1 for api in found_apis if api.get('risk', 0) >= 9)
+        if high_risk_apis >= 2:
+            confidence += 0.4
+            reasons.append(f"{high_risk_apis} critical APIs")
+        elif high_risk_apis == 1:
+            confidence += 0.3
+            reasons.append("1 critical API")
+        elif len(found_apis) >= 2:
+            confidence += 0.2
+            reasons.append(f"{len(found_apis)} APIs")
+        else:
+            confidence += 0.1
+            reasons.append("API indicator")
+    
+    # Factor 2: IOCTL Handler Verification (+0.3)
+    if analysis_result == "Custom IOCTL" and handler_addr:
+        confidence += 0.3
+        reasons.append("Custom IOCTL verified")
+    elif analysis_result == "Custom IOCTL":
+        confidence += 0.15
+        reasons.append("Custom IOCTL unverified")
+    
+    # Factor 3: Name Consistency Check (+0.2)
+    if driver_obj_name and module_name:
+        obj_short = driver_obj_name.lower().split('\\')[-1].replace('.sys', '')
+        mod_short = module_name.lower().replace('.sys', '').split('\\')[-1]
+        if obj_short == mod_short:
+            confidence += 0.1
+            reasons.append("Name verified")
+        else:
+            confidence += 0.2  # Mismatch is HIGH confidence for maliciousness
+            reasons.append("Name mismatch detected")
+    
+    # Factor 4: Multiple Indicators Boost (+0.1)
+    indicator_count = sum([
+        bool(found_apis),
+        analysis_result == "Custom IOCTL",
+        bool(handler_addr)
+    ])
+    if indicator_count >= 2:
+        confidence += 0.1
+        reasons.append("Multiple indicators")
+    
+    confidence = min(1.0, confidence)
+    reason_str = ", ".join(reasons) if reasons else "Heuristics only"
+    
+    return confidence, reason_str
+
 
 def calculate_confidence(detection_methods: List[str], context: Dict) -> float:
     """
