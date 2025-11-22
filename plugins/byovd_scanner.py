@@ -39,7 +39,7 @@ find_dangerous_apis = None
 calculate_driver_risk = None
 
 try:
-    # Add the iKARMA root directory to path (core/ and utils/ are there)
+    # Import from sibling directories (core/ and utils/ are in same parent as this file)
     ikarma_root = str(Path(__file__).parent)
     if ikarma_root not in sys.path:
         sys.path.insert(0, ikarma_root)
@@ -50,7 +50,7 @@ try:
 except Exception as e:
     # Store error for debug output
     import_error = str(e)
-    pass
+    HAS_IKARMA_MODULES = False
 
 vollog = logging.getLogger(__name__)
 
