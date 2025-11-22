@@ -87,8 +87,8 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                         vollog.info(f"    DriverName (full): '{driver_name_full}'")
                         try:
                             vollog.info(f"    DriverStart: {hex(driver_obj.DriverStart)}")
-                        except:
-                            vollog.info(f"    DriverStart: <unavailable>")
+                        except (AttributeError, exceptions.InvalidAddressException) as e:
+                            vollog.info(f"    DriverStart: <unavailable> ({type(e).__name__})")
                     
                     # Driver names in DRIVER_OBJECT are like "\\Driver\\Ntfs" or "\\FileSystem\\Npfs"
                     # Extract the last component and normalize
@@ -185,10 +185,10 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                     driver_name = None
                     try:
                         driver_name = mod.BaseDllName.get_string()
-                    except:
+                    except (AttributeError, exceptions.InvalidAddressException):
                         try:
                             driver_name = mod.FullDllName.get_string()
-                        except:
+                        except (AttributeError, exceptions.InvalidAddressException):
                             continue
 
                     if not driver_name:
@@ -240,10 +240,10 @@ class DriverAnalysis(interfaces.plugins.PluginInterface):
                             handler_int = None
                             try:
                                 handler_int = int(handler_ptr)
-                            except:
+                            except (TypeError, ValueError, AttributeError):
                                 try:
                                     handler_int = int(handler_ptr.dereference())
-                                except:
+                                except (TypeError, ValueError, AttributeError, exceptions.InvalidAddressException):
                                     handler_int = 0
 
                             if debug_mode and driver_count <= 10:

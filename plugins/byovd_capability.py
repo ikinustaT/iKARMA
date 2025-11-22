@@ -104,6 +104,50 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
             )
         ]
 
+    def _safe_read_memory(self, layer, address: int, size: int, max_size: int = 0x100000, pad: bool = True) -> Optional[bytes]:
+        """
+        Safely read memory with bounds checking to prevent invalid access.
+
+        Args:
+            layer: Volatility memory layer
+            address: Memory address to read from
+            size: Number of bytes to read
+            max_size: Maximum allowed read size (default 1MB)
+            pad: Whether to pad with zeros if read fails
+
+        Returns:
+            Bytes read from memory, or None if address is invalid
+
+        Security:
+            - Validates address is not zero/NULL
+            - Enforces maximum read size to prevent resource exhaustion
+            - Catches InvalidAddressException to prevent crashes
+        """
+        # Bounds check: Reject NULL pointers
+        if address == 0:
+            vollog.debug(f"Rejected NULL pointer read at 0x0")
+            return None
+
+        # Bounds check: Enforce maximum read size
+        if size > max_size:
+            vollog.warning(f"Read size {size} exceeds maximum {max_size}, capping to max")
+            size = max_size
+
+        # Bounds check: Reject negative sizes
+        if size <= 0:
+            vollog.debug(f"Rejected invalid size {size}")
+            return None
+
+        # Attempt safe read with exception handling
+        try:
+            return layer.read(address, size, pad=pad)
+        except exceptions.InvalidAddressException as e:
+            vollog.debug(f"Invalid address 0x{address:x}: {e}")
+            return None
+        except Exception as e:
+            vollog.warning(f"Unexpected error reading memory at 0x{address:x}: {type(e).__name__}")
+            return None
+
     def _find_target_driver(self, target_name: str):
         """
         Find the specific driver module and DRIVER_OBJECT.
@@ -128,12 +172,12 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
                     continue
                     
                 driver_normalized = driver_name.lower().replace('.sys', '')
-                
+
                 if target_normalized in driver_normalized or driver_normalized in target_normalized:
                     module_obj = mod
                     vollog.info(f"✓ Found module: {driver_name}")
                     break
-            except:
+            except (AttributeError, exceptions.InvalidAddressException, UnicodeDecodeError):
                 continue
         
         if not module_obj:
@@ -145,12 +189,12 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
             try:
                 driver_name_full = drv.DriverName.get_string()
                 driver_short = driver_name_full.split('\\')[-1].lower()
-                
+
                 if target_normalized == driver_short.replace('.sys', ''):
                     driver_obj = drv
                     vollog.info(f"✓ Found DRIVER_OBJECT: {driver_name_full}")
                     break
-            except:
+            except (AttributeError, exceptions.InvalidAddressException, UnicodeDecodeError):
                 continue
         
         return module_obj, driver_obj, target_normalized
@@ -162,10 +206,12 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
         """
         try:
             layer = self.context.layers[layer_name]
-            
-            # Read DOS header
-            dos_header = layer.read(base_addr, 0x40, pad=True)
-            
+
+            # Read DOS header with bounds checking
+            dos_header = self._safe_read_memory(layer, base_addr, 0x40, pad=True)
+            if dos_header is None:
+                return {'valid': False, 'reason': 'Cannot read DOS header'}
+
             # Check MZ signature
             if dos_header[0:2] != b'MZ':
                 return {'valid': False, 'reason': 'No MZ signature'}
@@ -177,10 +223,12 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
             if e_lfanew > 0x1000:  # Sanity check
                 return {'valid': False, 'reason': 'Invalid PE offset'}
             
-            # Read PE signature
+            # Read PE signature with bounds checking
             pe_offset = base_addr + e_lfanew
-            pe_data = layer.read(pe_offset, 0x100, pad=True)
-            
+            pe_data = self._safe_read_memory(layer, pe_offset, 0x100, pad=True)
+            if pe_data is None:
+                return {'valid': False, 'reason': 'Cannot read PE header'}
+
             if pe_data[0:4] != b'PE\x00\x00':
                 return {'valid': False, 'reason': 'No PE signature'}
             
@@ -245,7 +293,9 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
             for offset in range(0, min(size, 0x10000), chunk_size):  # Limit to first 64KB for performance
                 try:
                     chunk_addr = base_addr + offset
-                    data = layer.read(chunk_addr, chunk_size, pad=True)
+                    data = self._safe_read_memory(layer, chunk_addr, chunk_size, pad=True)
+                    if data is None:
+                        continue
                     
                     # Count non-zero bytes (actual data vs padding)
                     non_zero = sum(1 for b in data if b != 0)
@@ -299,7 +349,9 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
                 vollog.info(f"  Focusing on IOCTL handler at offset +{hex(handler_offset)}")
                 
                 try:
-                    handler_data = layer.read(handler_addr, 0x1000, pad=True)
+                    handler_data = self._safe_read_memory(layer, handler_addr, 0x1000, pad=True)
+                    if handler_data is None:
+                        continue
                     cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if stats['architecture'] == 'x64' else capstone.CS_MODE_32)
                     cs.detail = False
                     
@@ -414,7 +466,10 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
         """
         try:
             layer = self.context.layers[layer_name]
-            data = layer.read(base_addr, min(size, 0x10000), pad=True)  # Read first 64KB
+            # Read first 64KB with bounds checking
+            data = self._safe_read_memory(layer, base_addr, min(size, 0x10000), pad=True)
+            if data is None:
+                return []
             
             strings = []
             current_string = []
@@ -495,8 +550,8 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
                     handler_ptr = driver_obj.MajorFunction[IRP_MJ_DEVICE_CONTROL]
                     handler_addr = int(handler_ptr)
                     vollog.info(f"IOCTL Handler: {hex(handler_addr)}")
-                except:
-                    vollog.warning("Could not extract IOCTL handler")
+                except (AttributeError, TypeError, IndexError, exceptions.InvalidAddressException) as e:
+                    vollog.warning(f"Could not extract IOCTL handler: {type(e).__name__}")
             
             # PHASE 1: PE Header Analysis (Forensic Metadata)
             vollog.info("")
@@ -514,7 +569,7 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
                     try:
                         compile_time = datetime.datetime.utcfromtimestamp(pe_info['timestamp'])
                         vollog.info(f"  Compiled: {compile_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-                    except:
+                    except (ValueError, OSError, OverflowError):
                         vollog.info(f"  Timestamp: {hex(pe_info['timestamp'])}")
             else:
                 vollog.warning(f"⚠ PE header not readable: {pe_info.get('reason', 'Unknown')}")
@@ -734,7 +789,7 @@ class BYOVDCapability(interfaces.plugins.PluginInterface):
                         import datetime
                         compile_time = datetime.datetime.utcfromtimestamp(pe_info['timestamp'])
                         compile_time_str = compile_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-                    except:
+                    except (ValueError, OSError, OverflowError):
                         compile_time_str = f"Timestamp: {hex(pe_info['timestamp'])}"
                 
                 yield (0, (

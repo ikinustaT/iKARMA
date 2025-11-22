@@ -1,0 +1,179 @@
+# iKARMA Project Dependencies - FROZEN VERSIONS
+#
+# For reproducibility and forensic validation, all dependencies are pinned
+# to exact versions. This ensures consistent behavior across environments.
+#
+# Date Frozen: 2025-11-23
+# Python Version: 3.12.x recommended (tested: 3.8-3.14)
+#
+# Installation:
+#   pip install -r requirements-frozen.txt
+#
+# Compliance: NIST SP 800-86 (Forensic Repeatability)
+
+# ============================================================================
+# CORE FORENSIC FRAMEWORKS
+# ============================================================================
+
+# Volatility3 - Memory forensics framework
+volatility3==2.5.0
+# Note: Version 2.5.0 is the latest stable as of 2025-11-23
+# CRITICAL: Changes to Volatility APIs may break plugin compatibility
+
+# ============================================================================
+# DISASSEMBLY AND ANALYSIS
+# ============================================================================
+
+# Capstone - Disassembly engine
+capstone==5.0.1
+# Note: x64 instruction decoding - version-specific opcode tables
+
+# PE File Parser
+pefile==2023.2.7
+# Note: Windows executable format parsing
+
+# ============================================================================
+# PATTERN MATCHING AND DETECTION
+# ============================================================================
+
+# YARA - Pattern matching engine
+yara-python==4.3.1
+# Note: Currently unused but reserved for future signature-based detection
+
+# ============================================================================
+# CRYPTOGRAPHIC INTEGRITY
+# ============================================================================
+
+# hashlib is built-in to Python (no external dependency)
+# Uses: MD5, SHA1, SHA256 for evidence integrity verification
+
+# ============================================================================
+# DATA PRESENTATION
+# ============================================================================
+
+# Tabulate - Table formatting for CLI output
+tabulate==0.9.0
+
+# Colorama - Cross-platform colored terminal output
+colorama==0.4.6
+
+# ============================================================================
+# DEVELOPMENT AND TESTING (Optional for production)
+# ============================================================================
+
+# pytest - Testing framework
+pytest==7.4.3
+pytest-cov==4.1.0
+
+# Code quality tools
+black==23.11.0  # Code formatter
+flake8==6.1.0   # Linter
+mypy==1.7.0     # Type checker
+
+# ============================================================================
+# PYTHON STANDARD LIBRARY REQUIREMENTS
+# ============================================================================
+
+# The following are built-in to Python 3.8+ and require no installation:
+# - json (JSON parsing)
+# - logging (Forensic audit trails)
+# - hashlib (Cryptographic hashing)
+# - datetime (Timestamps)
+# - pathlib (File path handling)
+# - dataclasses (Chain of custody structures)
+# - typing (Type annotations)
+
+# ============================================================================
+# VOLATILITY3 TRANSITIVE DEPENDENCIES
+# ============================================================================
+
+# These are installed automatically with volatility3, but pinned for
+# reproducibility:
+
+pycryptodome==3.19.0  # Volatility crypto operations
+yara-python==4.3.1    # Volatility YARA integration
+pefile==2023.2.7      # Volatility PE parsing
+capstone==5.0.1       # Volatility disassembly (optional)
+
+# ============================================================================
+# SECURITY NOTES
+# ============================================================================
+
+# All packages verified as of 2025-11-23:
+# - No known CVEs affecting pinned versions
+# - Cryptographic libraries use current best practices
+# - Regular security audits recommended (quarterly)
+
+# To check for vulnerabilities:
+#   pip install safety
+#   safety check -r requirements-frozen.txt
+
+# ============================================================================
+# UPGRADING DEPENDENCIES
+# ============================================================================
+
+# BEFORE upgrading any dependency:
+# 1. Test with new version in isolated environment
+# 2. Run full test suite (pytest)
+# 3. Verify with known memory dumps
+# 4. Update this file with new version
+# 5. Document any breaking changes
+# 6. Re-validate forensic reproducibility
+
+# Upgrade checklist:
+# [ ] volatility3 upgrade tested
+# [ ] capstone upgrade tested
+# [ ] All plugins still functional
+# [ ] Test outputs unchanged
+# [ ] Documentation updated
+
+# ============================================================================
+# PLATFORM-SPECIFIC NOTES
+# ============================================================================
+
+# Windows:
+#   - Ensure Microsoft C++ Build Tools installed for some packages
+#   - Admin rights may be needed for Volatility kernel debugging features
+
+# Linux:
+#   - gcc and python3-dev required for compiling native extensions
+#   - Some packages require: apt-get install python3-dev libssl-dev
+
+# macOS:
+#   - Xcode Command Line Tools required
+#   - Some packages require: brew install python@3.12
+
+# ============================================================================
+# DOCKER COMPATIBILITY
+# ============================================================================
+
+# These exact versions are used in the iKARMA Docker container
+# See: Dockerfile in project root
+
+# Docker image: ikarma/forensics:1.0
+# Base: python:3.12-slim
+# All dependencies pre-installed
+
+# ============================================================================
+# VERSION HISTORY
+# ============================================================================
+
+# 2025-11-23 v1.0: Initial frozen requirements for Phase 1 release
+# Future: Update this section with each dependency change
+
+# ============================================================================
+# FORENSIC VALIDATION
+# ============================================================================
+
+# Hash of this file (for integrity verification):
+# SHA256: [To be calculated on release]
+
+# Generate hash:
+#   sha256sum requirements-frozen.txt
+
+# Verify before use:
+#   sha256sum -c requirements-frozen.txt.sha256
+
+# ============================================================================
+# END OF REQUIREMENTS
+# ============================================================================

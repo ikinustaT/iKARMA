@@ -35,18 +35,30 @@ except Exception:
 
 # Import iKARMA modules - they should be in the same directory
 HAS_IKARMA_MODULES = False
+HAS_FORENSIC_MODULES = False
 find_dangerous_apis = None
 calculate_driver_risk = None
+ChainOfCustody = None
+calculate_file_hashes = None
 
 try:
     # Import from sibling directories (core/ and utils/ are in same parent as this file)
     ikarma_root = str(Path(__file__).parent)
     if ikarma_root not in sys.path:
         sys.path.insert(0, ikarma_root)
-    
+
     from utils.api_scanner import find_dangerous_apis
     from core.risk_scorer import calculate_driver_risk
     HAS_IKARMA_MODULES = True
+
+    # Import forensic compliance modules
+    try:
+        from core.chain_of_custody import ChainOfCustody, AnalystInfo
+        from utils.forensic_integrity import calculate_file_hashes, verify_file_integrity
+        HAS_FORENSIC_MODULES = True
+    except Exception:
+        HAS_FORENSIC_MODULES = False
+
 except Exception as e:
     # Store error for debug output
     import_error = str(e)
@@ -107,8 +119,72 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                 description="Include detailed API findings in output",
                 optional=True,
                 default=False
+            ),
+            requirements.StringRequirement(
+                name="coc-analyst",
+                description="Analyst name for chain of custody (enables forensic mode)",
+                optional=True
+            ),
+            requirements.StringRequirement(
+                name="coc-analyst-id",
+                description="Analyst ID for chain of custody",
+                optional=True
+            ),
+            requirements.StringRequirement(
+                name="coc-case-id",
+                description="Case ID for chain of custody",
+                optional=True
+            ),
+            requirements.StringRequirement(
+                name="output-dir",
+                description="Output directory for forensic reports (chain of custody JSON)",
+                optional=True
             )
         ]
+
+    def _safe_read_memory(self, layer, address: int, size: int, max_size: int = 0x100000, pad: bool = True) -> Optional[bytes]:
+        """
+        Safely read memory with bounds checking to prevent invalid access.
+
+        Args:
+            layer: Volatility memory layer
+            address: Memory address to read from
+            size: Number of bytes to read
+            max_size: Maximum allowed read size (default 1MB)
+            pad: Whether to pad with zeros if read fails
+
+        Returns:
+            Bytes read from memory, or None if address is invalid
+
+        Security:
+            - Validates address is not zero/NULL
+            - Enforces maximum read size to prevent resource exhaustion
+            - Catches InvalidAddressException to prevent crashes
+        """
+        # Bounds check: Reject NULL pointers
+        if address == 0:
+            vollog.debug(f"Rejected NULL pointer read at 0x0")
+            return None
+
+        # Bounds check: Enforce maximum read size
+        if size > max_size:
+            vollog.warning(f"Read size {size} exceeds maximum {max_size}, capping to max")
+            size = max_size
+
+        # Bounds check: Reject negative sizes
+        if size <= 0:
+            vollog.debug(f"Rejected invalid size {size}")
+            return None
+
+        # Attempt safe read with exception handling
+        try:
+            return layer.read(address, size, pad=pad)
+        except exceptions.InvalidAddressException as e:
+            vollog.debug(f"Invalid address 0x{address:x}: {e}")
+            return None
+        except Exception as e:
+            vollog.warning(f"Unexpected error reading memory at 0x{address:x}: {type(e).__name__}")
+            return None
 
     def _build_driver_object_map(self, debug_mode: bool) -> Dict[str, object]:
         """
@@ -187,7 +263,9 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
             
         try:
             layer = self.context.layers[layer_name]
-            data = layer.read(address, size, pad=True)
+            data = self._safe_read_memory(layer, address, size, pad=True)
+            if data is None:
+                return []
             
             # Try 64-bit disassembly
             cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
@@ -215,6 +293,54 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
         tier_mode = self.config.get("tier", "all").lower()
         detailed_mode = self.config.get("detailed", False)
         export_json_path = self.config.get("export-json", None)
+
+        # Forensic Mode: Chain of Custody
+        coc_analyst = self.config.get("coc-analyst", None)
+        coc_analyst_id = self.config.get("coc-analyst-id", None)
+        coc_case_id = self.config.get("coc-case-id", None)
+        output_dir = self.config.get("output-dir", None)
+
+        chain_of_custody = None
+        forensic_mode = False
+
+        if coc_analyst and HAS_FORENSIC_MODULES:
+            forensic_mode = True
+            try:
+                analyst_info = AnalystInfo(
+                    name=coc_analyst,
+                    id=coc_analyst_id or "N/A",
+                    organization=None,
+                    certification=None
+                )
+                chain_of_custody = ChainOfCustody(
+                    analyst=analyst_info,
+                    case_id=coc_case_id or "N/A",
+                    output_dir=output_dir or "."
+                )
+                # Start forensic session
+                session_id = chain_of_custody.start_analysis(
+                    evidence_file=f"Memory Dump (Volatility Context)",
+                    evidence_hashes={},  # Memory dumps analyzed in-place
+                    command_line=" ".join(sys.argv) if hasattr(sys, 'argv') else "N/A"
+                )
+                vollog.info("=" * 80)
+                vollog.info("FORENSIC MODE ENABLED")
+                vollog.info(f"Session ID: {session_id}")
+                vollog.info(f"Analyst: {coc_analyst} ({coc_analyst_id})")
+                vollog.info(f"Case ID: {coc_case_id or 'N/A'}")
+                vollog.info("=" * 80)
+                chain_of_custody.log_action(
+                    "scan_start",
+                    "Started BYOVD driver scan",
+                    details={"tier_mode": tier_mode, "detailed": detailed_mode},
+                    severity="info"
+                )
+            except Exception as e:
+                vollog.warning(f"Chain of custody initialization failed: {e}")
+                forensic_mode = False
+        elif coc_analyst and not HAS_FORENSIC_MODULES:
+            vollog.warning("Forensic mode requested but modules not available")
+            vollog.warning("Install forensic modules: core/chain_of_custody.py")
 
         if debug_mode:
             vollog.setLevel(logging.DEBUG)
@@ -292,7 +418,7 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                             lt = m.LoadTime
                             if lt and lt > 0:
                                 all_load_times.append(lt)
-                    except:
+                    except (AttributeError, TypeError, exceptions.InvalidAddressException):
                         pass
                 except Exception:
                     continue
@@ -313,10 +439,10 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                     driver_name = None
                     try:
                         driver_name = mod.BaseDllName.get_string()
-                    except:
+                    except (AttributeError, exceptions.InvalidAddressException):
                         try:
                             driver_name = mod.FullDllName.get_string()
-                        except:
+                        except (AttributeError, exceptions.InvalidAddressException):
                             continue
 
                     if not driver_name:
@@ -387,10 +513,10 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                             # Convert to integer
                             try:
                                 handler_int = int(handler_ptr)
-                            except:
+                            except (TypeError, ValueError, AttributeError):
                                 try:
                                     handler_int = int(handler_ptr.dereference())
-                                except:
+                                except (TypeError, ValueError, AttributeError, exceptions.InvalidAddressException):
                                     handler_int = 0
 
                             if debug_mode and driver_count <= 10:
@@ -572,10 +698,51 @@ class BYOVDScanner(interfaces.plugins.PluginInterface):
                             'drivers': json_results
                         }, f, indent=2)
                     vollog.info(f"✓ Results exported to: {export_json_path}")
+                    if forensic_mode and chain_of_custody:
+                        chain_of_custody.log_action(
+                            "json_export",
+                            f"Exported results to JSON: {export_json_path}",
+                            details={"file_path": export_json_path},
+                            severity="info"
+                        )
                 except Exception as e:
                     vollog.error(f"JSON export failed: {e}")
+                    if forensic_mode and chain_of_custody:
+                        chain_of_custody.log_action(
+                            "json_export_error",
+                            f"JSON export failed: {e}",
+                            details={"error": str(e)},
+                            severity="error"
+                        )
+
+            # Finalize chain of custody
+            if forensic_mode and chain_of_custody:
+                results_summary = {
+                    'total_modules': count,
+                    'drivers_analyzed': driver_count,
+                    'custom_ioctl': ioctl_found_count,
+                    'api_detections': api_detections,
+                    'high_risk_drivers': sum(1 for d in json_results if d.get('risk_score', 0) >= 70)
+                }
+                coc_path = chain_of_custody.complete_analysis(
+                    results_summary=results_summary,
+                    status="completed"
+                )
+                vollog.info("=" * 80)
+                vollog.info(f"FORENSIC CHAIN OF CUSTODY: {coc_path}")
+                vollog.info("=" * 80)
 
         except Exception as e:
+            # Log error to chain of custody before re-raising
+            if forensic_mode and chain_of_custody:
+                chain_of_custody.log_action(
+                    "fatal_error",
+                    f"Fatal error during analysis: {e}",
+                    details={"error": str(e), "traceback": str(traceback.format_exc())},
+                    severity="critical"
+                )
+                chain_of_custody.complete_analysis(status="error")
+
             vollog.error(f"FATAL ERROR: {e}")
             import traceback
             vollog.error(traceback.format_exc())

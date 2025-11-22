@@ -5,7 +5,8 @@
       "Bash(python utils/api_scanner.py:*)",
       "Bash(python:*)",
       "Bash(git add:*)",
-      "Bash(/c/Users/marty/OneDrive/Documents/GitHub/iKARMA/ikarma-env/bin/python.exe:*)"
+      "Bash(/c/Users/marty/OneDrive/Documents/GitHub/iKARMA/ikarma-env/bin/python.exe:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []
