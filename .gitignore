@@ -1,0 +1,25 @@
+# Volatility local artifacts
+volatility3/__pycache__/
+volatility3/plugins/__pycache__/
+volatility3/framework/__pycache__/
+
+# Memory dumps
+*.raw
+*.mem
+*.dmp
+*.zip
+*.7z
+*.bin
+
+# iKARMA logs/exports
+exports/
+*.json
+*.csv
+*.html
+*.pdf
+*.docx
+
+# Ignore virtual environments
+.venv/
+venv/
+env/
