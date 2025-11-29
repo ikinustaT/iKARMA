@@ -1,7 +1,5 @@
 # iKARMA - Kernel Driver Analysis for Memory Forensics
 
-**Production Release v2.0.0**
-
 iKARMA is a specialized memory forensics tool designed to identify and analyze potentially dangerous kernel drivers in Windows memory dumps.
 
 ## Key Features
