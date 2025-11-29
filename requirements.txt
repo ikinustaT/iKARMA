@@ -5,8 +5,7 @@ pefile>=2023.2.7
 capstone>=5.0.0
 rich>=13.7.1
 
-# Optional: Volatility3 for full memory analysis
-# volatility3>=2.0.0
+volatility3>=2.0.0
 
 # Development dependencies
 pytest>=7.0.0
