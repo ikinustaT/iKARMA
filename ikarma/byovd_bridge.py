@@ -19,16 +19,15 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def load_byovd_api_scanner() -> Optional[Callable[[List[str]], List[Dict[str, Any]]]]:
     """
-    Attempt to import the legacy BYOVD API scanner.
+    Load BYOVD API scanner.
 
     Returns:
         Callable if available, otherwise None.
     """
-    # Candidate paths where the legacy utilities may live relative to v2 repo root
     this_dir = Path(__file__).resolve().parent
     repo_root = this_dir.parent
     candidates = [
-        repo_root / "utils",  # legacy utils copied into v2 root
+        repo_root / "utils", 
     ]
 
     for path in candidates:
