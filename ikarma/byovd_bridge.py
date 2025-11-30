@@ -1,10 +1,5 @@
 """
 Lightweight bridge to reuse the BYOVD API scanner from the v1 codebase.
-
-This module tries to import ``find_dangerous_apis`` from the original iKARMA
-utilities (kept in the sibling ``iKARMA`` directory). If the modules are not
-present, the bridge simply returns ``None`` so the caller can skip BYOVD
-analysis without failing the pipeline.
 """
 
 import sys
