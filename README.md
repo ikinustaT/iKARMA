@@ -1,4 +1,4 @@
-# iKARMA - Kernel Driver Analysis for Memory Forensics
+# iKARMA - IOCTL Kernel Artifact Risk Mapping & Analysis
 
 iKARMA is a specialized memory forensics tool designed to identify and analyze potentially dangerous kernel drivers in Windows memory dumps. 
 
