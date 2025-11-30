@@ -1,6 +1,7 @@
-# Ignore python cache files
+# Ignore files
 __pycache__/
 *.pyc
+ikarma.egg-info/
 
 # Memory dumps
 *.raw
