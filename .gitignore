@@ -2,6 +2,7 @@
 volatility3/__pycache__/
 volatility3/plugins/__pycache__/
 volatility3/framework/__pycache__/
+ikarma/core/__pycache__/
 
 # Memory dumps
 *.raw

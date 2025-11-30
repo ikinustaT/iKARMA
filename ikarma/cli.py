@@ -15,10 +15,41 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.progress import Progress
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
 from ikarma import __version__
-from ikarma.core import Analyzer, AnalysisResult, HTMLReportGenerator
+from ikarma.core import AnalysisResult, HTMLReportGenerator
+from ikarma.core.enhanced_analyzer import EnhancedAnalyzer
+
+
+class ProgressLoggingHandler(logging.Handler):
+    """Custom logging handler to update progress bar."""
+
+    def __init__(self, progress, task_id):
+        super().__init__()
+        self.progress = progress
+        self.task_id = task_id
+        self.status_map = {
+            'Enumerating drivers': 'Enumerating drivers from memory',
+            'Parsing driver': 'Parsing driver objects',
+            'Analyzing capabilities': 'Detecting driver capabilities',
+            'DKOM detection': 'Running DKOM detection',
+            'Cross-view': 'Cross-view validation',
+            'Risk scoring': 'Calculating risk scores',
+            'Enhanced': 'Running enhanced analysis',
+            'Bayesian': 'Applying Bayesian scoring',
+        }
+
+    def emit(self, record):
+        """Update progress bar with log message."""
+        try:
+            msg = record.getMessage()
+            for key, status in self.status_map.items():
+                if key.lower() in msg.lower():
+                    self.progress.update(self.task_id, description=f"[cyan]{status}...")
+                    break
+        except:
+            pass
 
 
 def setup_logging(verbose: bool = False, debug: bool = False):
@@ -29,7 +60,7 @@ def setup_logging(verbose: bool = False, debug: bool = False):
         level = logging.INFO
     else:
         level = logging.WARNING
-    
+
     logging.basicConfig(
         level=level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -294,39 +325,89 @@ def cmd_analyze(args):
         'dkom_deep': args.dkom_deep,
     }
 
-    # Run analysis
-    analyzer = Analyzer(str(memory_path), config)
+    # Run analysis with EnhancedAnalyzer (includes all original + advanced features)
+    analyzer = EnhancedAnalyzer(str(memory_path), config)
 
-    if not analyzer.initialize():
-        console.print("[bold red]Error: Failed to initialize analyzer[/bold red]")
-        return 1
+    # Create progress bar
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False
+    ) as progress:
+        # Initialization phase
+        task = progress.add_task("[cyan]Initializing analyzer...", total=None)
 
-    result = analyzer.analyze()
+        # Add progress handler to logging
+        progress_handler = ProgressLoggingHandler(progress, task)
+        progress_handler.setLevel(logging.INFO)
+        logging.getLogger('ikarma').addHandler(progress_handler)
+
+        if not analyzer.initialize():
+            progress.stop()
+            console.print("[bold red]Error: Failed to initialize analyzer[/bold red]")
+            return 1
+
+        progress.update(task, description="[cyan]Initialization complete")
+
+        # Analysis phase
+        progress.update(task, description="[cyan]Starting analysis...")
+        result = analyzer.analyze()
+
+        # Remove progress handler
+        logging.getLogger('ikarma').removeHandler(progress_handler)
+
+        progress.update(task, description="[green][OK] Analysis complete!", completed=100, total=100)
 
     # Print summary
     print_summary(result, limit=args.limit)
 
     # Auto-generate HTML report with timestamped filename
-    try:
-        # Generate filename: <dump_name>_<HHMM>_<DDMMYYYY>.html
-        now = datetime.now()
-        dump_name = memory_path.stem  # Get filename without extension
-        timestamp = now.strftime('%H%M_%d%m%Y')
-        html_filename = f"{dump_name}_{timestamp}.html"
-        html_path = Path(html_filename)
+    console.print()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        console=console,
+        transient=True
+    ) as progress:
+        try:
+            progress.add_task("[cyan]Generating HTML report...", total=None)
 
-        html_generator = HTMLReportGenerator(result)
-        html_generator.generate(str(html_path))
-        console.print(f"\n[green]HTML report auto-generated: {html_path}[/green]")
-        console.print(f"[cyan]Open in browser to view the full interactive report[/cyan]")
-    except Exception as e:
-        console.print(f"[yellow]Warning: Could not generate HTML report: {e}[/yellow]")
+            # Create "Analysis Reports" folder if it doesn't exist
+            reports_dir = Path("Analysis Reports")
+            if not reports_dir.exists():
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                console.print(f"[dim]Created directory: {reports_dir}[/dim]")
+
+            # Generate filename: <dump_name>_<HHMM>_<DDMMYYYY>.html
+            now = datetime.now()
+            dump_name = memory_path.stem  # Get filename without extension
+            timestamp = now.strftime('%H%M_%d%m%Y')
+            html_filename = f"{dump_name}_{timestamp}.html"
+            html_path = reports_dir / html_filename
+
+            html_generator = HTMLReportGenerator(result)
+            html_generator.generate(str(html_path))
+
+            console.print(f"[green][OK] HTML report auto-generated: {html_path}[/green]")
+            console.print(f"[cyan]  Open in browser to view the full interactive report[/cyan]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Warning: Could not generate HTML report: {e}[/yellow]")
 
     # Export JSON if requested
     if args.output:
         output_path = Path(args.output)
-        analyzer.export_json(str(output_path))
-        console.print(f"\n[green]Results exported to: {output_path}[/green]")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            console=console,
+            transient=True
+        ) as progress:
+            progress.add_task("[cyan]Exporting JSON results...", total=None)
+            analyzer.export_json(str(output_path))
+        console.print(f"[green][OK] Results exported to: {output_path}[/green]")
 
     # Export to stdout as JSON if requested
     if args.json:

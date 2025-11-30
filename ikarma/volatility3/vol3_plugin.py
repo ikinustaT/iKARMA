@@ -451,6 +451,94 @@ class VolatilityBridge:
 
         return drivers
     
+    def enumerate_threads(self) -> List[Dict[str, Any]]:
+        """
+        Enumerate system threads.
+        
+        Returns list of thread info dicts.
+        """
+        if not self.is_initialized or not self.layer_name:
+            return []
+            
+        threads = []
+        
+        try:
+            from volatility3.plugins.windows import pslist
+            
+            # Use PsList.list_processes class method directly to avoid instance config issues
+            # We don't need to instantiate the plugin if we just use the static/class method
+            
+            ethread_type = self.symbol_table + constants.BANG + "_ETHREAD"
+            
+            # Log layer name for debugging
+            logger.debug(f"Enumerating threads using kernel module: {self.kernel.name}")
+            
+            # Use kernel_module_name instead of layer_name as per signature inspection
+            # symbol_table is not a valid argument in this version
+            for proc in pslist.PsList.list_processes(context=self.context, kernel_module_name=self.kernel.name):
+                try:
+                    # Filter for System process (PID 4)
+                    if proc.UniqueProcessId != 4:
+                        continue
+                        
+                    # Iterate threads
+                    # Use the standard Volatility way to walk the list
+                    for thread in proc.ThreadListHead.to_list(ethread_type, "ThreadListEntry"):
+                        try:
+                            tid = int(thread.Cid.UniqueThread)
+                            start_addr = int(thread.StartAddress)
+                            
+                            # Win10+ might use Win32StartAddress
+                            win32_start = 0
+                            if hasattr(thread, 'Win32StartAddress'):
+                                win32_start = int(thread.Win32StartAddress)
+                                
+                            threads.append({
+                                'tid': tid,
+                                'start_address': start_addr,
+                                'win32_start_address': win32_start,
+                                'process_id': 4,
+                                'process_name': 'System'
+                            })
+                        except:
+                            continue
+                            
+                except Exception as e:
+                    logger.debug(f"Error processing process {proc.UniqueProcessId}: {e}")
+                    continue
+            
+            logger.info(f"Enumerated {len(threads)} system threads")
+            
+        except Exception as e:
+            logger.warning(f"Thread enumeration failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            
+        return threads
+    
+    def resolve_symbol(self, symbol_name: str) -> Optional[int]:
+        """
+        Resolve a kernel symbol to an address.
+        """
+        if not self.is_initialized or not self.kernel:
+            return None
+            
+        try:
+            # Volatility3 symbols are usually accessed via context.symbol_space
+            # Format: module!symbol
+            full_name = self.symbol_table + constants.BANG + symbol_name
+            
+            # Get symbol address
+            # This might return a Symbol object or address
+            sym = self.context.symbol_space.get_symbol(full_name)
+            if sym:
+                return int(sym.address)
+                
+        except Exception as e:
+            logger.debug(f"Symbol resolution failed for {symbol_name}: {e}")
+            
+        return None
+    
     def _read_major_function_table(self, driver_object_addr: int) -> Dict[int, int]:
         """Read MajorFunction table from a DRIVER_OBJECT."""
         mf_table = {}

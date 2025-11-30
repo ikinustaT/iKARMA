@@ -260,9 +260,9 @@ class MemoryParser:
                 if not mod.get('base'):
                     continue
                 
-                # Filter for .sys files (drivers)
+                # Filter for kernel modules (drivers, kernel, HAL)
                 name = mod.get('name', '').lower()
-                if not name.endswith('.sys'):
+                if not any(name.endswith(ext) for ext in ['.sys', '.exe', '.dll']):
                     continue
                 
                 driver = DriverInfo(
@@ -285,6 +285,22 @@ class MemoryParser:
             logger.error(f"Volatility3 enumeration failed: {e}")
         
         return drivers
+
+    def enumerate_modules(self) -> List[Dict[str, Any]]:
+        """
+        Lightweight wrapper to expose module enumeration to other components.
+        """
+        if not self._volatility_working or not self._vol_bridge:
+            return []
+
+        try:
+            modules = self._vol_bridge.enumerate_modules()
+            if not modules:
+                return []
+            return modules
+        except Exception as e:
+            logger.debug(f"Module enumeration failed: {e}")
+            return []
     
     def enumerate_drivers_scan(self) -> List[DriverInfo]:
         """
@@ -337,6 +353,17 @@ class MemoryParser:
             logger.error(f"Driver scan failed: {e}")
         
         return drivers
+    
+        return drivers
+    
+    def enumerate_threads(self) -> List[Dict[str, Any]]:
+        """
+        Enumerate system threads using Volatility3.
+        """
+        if not self._volatility_working or not self._vol_bridge:
+            return []
+            
+        return self._vol_bridge.enumerate_threads()
     
     def _parse_major_functions(self, driver: DriverInfo, obj: DriverObjectInfo):
         """

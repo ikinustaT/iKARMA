@@ -27,6 +27,7 @@ from ikarma.core.capability_engine import CapabilityEngine
 from ikarma.core.antiforensic_detector import AntiForensicDetector
 from ikarma.core.risk_scorer import RiskScorer
 from ikarma.core.loldrivers import LOLDriversMatcher
+from ikarma.core.byovd_pattern_detector import BYOVDPatternDetector
 from ikarma.byovd_bridge import scan_dangerous_apis
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class Analyzer:
         self.antiforensic_detector: Optional[AntiForensicDetector] = None
         self.risk_scorer: Optional[RiskScorer] = None
         self.loldrivers_matcher: Optional[LOLDriversMatcher] = None
+        self.byovd_pattern_detector: Optional[BYOVDPatternDetector] = None
         
         # State
         self._is_initialized = False
@@ -102,7 +104,8 @@ class Analyzer:
             self.capability_engine = CapabilityEngine(self._architecture, self.config)
             self.antiforensic_detector = AntiForensicDetector(self._architecture, self.config)
             self.risk_scorer = RiskScorer(self.config)
-            
+            self.byovd_pattern_detector = BYOVDPatternDetector(self.config)
+
             # Initialize LOLDrivers matcher
             self.loldrivers_matcher = LOLDriversMatcher()
             self.loldrivers_matcher.load_database()
@@ -292,7 +295,10 @@ class Analyzer:
         # BYOVD/IOCTL dangerous API analysis (legacy scanner integration)
         if self.config.get("byovd_enabled", True):
             self._detect_byovd_capabilities(driver)
-        
+
+        # NEW: BYOVD pattern detection (behavioral analysis)
+        self._detect_byovd_patterns(driver, image)
+
         # Detect anti-forensic indicators
         self._detect_antiforensics(driver, pe_header, image)
         
@@ -332,26 +338,34 @@ class Analyzer:
                 driver.ioctl_handlers = [handler]
     
     def _detect_capabilities(self, driver: DriverInfo, image: Optional[bytes]):
-        """Detect driver capabilities."""
-        capabilities = []
-        
-        # Analyze IOCTL handlers
-        for handler in driver.ioctl_handlers:
-            handler_caps = self.capability_engine.analyze_handler(handler)
-            capabilities.extend(handler_caps)
-        
-        # Analyze full image if available
-        if image and len(image) > 0x200:
-            image_caps = self.capability_engine.analyze_image(image, driver.base_address)
-            capabilities.extend(image_caps)
-        
-        # Deduplicate
-        seen = set()
-        for cap in capabilities:
-            key = (cap.capability_type, cap.handler_offset)
-            if key not in seen:
-                seen.add(key)
-                driver.add_capability(cap)
+        """Detect driver capabilities with context-aware analysis."""
+
+        # Set driver context for context-aware detection
+        self.capability_engine._current_driver = driver
+
+        try:
+            capabilities = []
+
+            # Analyze IOCTL handlers
+            for handler in driver.ioctl_handlers:
+                handler_caps = self.capability_engine.analyze_handler(handler)
+                capabilities.extend(handler_caps)
+
+            # Analyze full image if available
+            if image and len(image) > 0x200:
+                image_caps = self.capability_engine.analyze_image(image, driver.base_address)
+                capabilities.extend(image_caps)
+
+            # Deduplicate
+            seen = set()
+            for cap in capabilities:
+                key = (cap.capability_type, cap.handler_offset)
+                if key not in seen:
+                    seen.add(key)
+                    driver.add_capability(cap)
+        finally:
+            # Clear driver context
+            self.capability_engine._current_driver = None
 
     def _detect_byovd_capabilities(self, driver: DriverInfo):
         """
@@ -420,7 +434,49 @@ class Analyzer:
                     exploitability="high" if risk_weight >= 8 else "medium",
                 )
                 driver.add_capability(cap)
-    
+
+    def _detect_byovd_patterns(self, driver: DriverInfo, image: Optional[bytes]):
+        """
+        Detect BYOVD patterns using behavioral analysis.
+
+        This complements signature-based LOLDrivers matching by detecting
+        unknown vulnerable drivers through capability patterns.
+        """
+        if not image:
+            return
+
+        # Run BYOVD pattern detection
+        patterns = self.byovd_pattern_detector.analyze_driver(driver, image)
+
+        # Mark driver as BYOVD if patterns detected
+        if patterns:
+            driver.byovd_detected = True
+            logger.info(f"BYOVD patterns detected in {driver.name}: {len(patterns)} patterns")
+
+            # Add patterns to driver for reporting
+            if not hasattr(driver, 'byovd_patterns'):
+                driver.byovd_patterns = []
+            driver.byovd_patterns.extend(patterns)
+
+            # Boost risk score for BYOVD patterns
+            for pattern in patterns:
+                # Create a high-priority capability for this pattern
+                from ikarma.core.driver import CapabilityType, ConfidenceLevel, DriverCapability
+
+                cap = DriverCapability(
+                    capability_type=CapabilityType.PHYSICAL_MEMORY_MAP if "PHYSICAL_MEMORY" in pattern.pattern_name
+                                    else CapabilityType.ARBITRARY_WRITE if "PROCESS_MEMORY" in pattern.pattern_name
+                                    else CapabilityType.UNKNOWN,
+                    confidence=pattern.confidence,
+                    confidence_level=ConfidenceLevel.HIGH if pattern.severity == "CRITICAL" else ConfidenceLevel.MEDIUM,
+                    description=f"BYOVD Pattern: {pattern.description}",
+                    evidence=pattern.evidence,
+                    handler_address=0,
+                    risk_weight=pattern.risk_weight,
+                    exploitability="high" if pattern.severity == "CRITICAL" else "medium",
+                )
+                driver.add_capability(cap)
+
     def _detect_antiforensics(
         self,
         driver: DriverInfo,
@@ -429,7 +485,7 @@ class Analyzer:
     ):
         """Detect anti-forensic indicators."""
         indicators = self.antiforensic_detector.analyze_driver(driver, pe_header, image)
-        
+
         for indicator in indicators:
             driver.add_anti_forensic_indicator(indicator)
     

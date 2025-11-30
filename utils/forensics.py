@@ -49,7 +49,7 @@ class PEAnomalyFlags:
     NON_CODE_EXECUTABLE = 1 << 7       # Data section marked executable
     MISMATCHED_ARCHITECTURE = 1 << 8   # Architecture doesn't match system
     ZERO_TIMESTAMP = 1 << 9            # Timestamp is zero (stripped)
-    MODIFIED_HEADER = 1 << 10          # PE header shows signs of tampering
+    HIGH_ENTROPY_SECTION = 1 << 11     # High entropy (packed/encrypted)
 
     @staticmethod
     def get_flag_names(flags: int) -> List[str]:
@@ -77,7 +77,38 @@ class PEAnomalyFlags:
             names.append("ZERO_TIMESTAMP")
         if flags & PEAnomalyFlags.MODIFIED_HEADER:
             names.append("MODIFIED_HEADER")
+        if flags & PEAnomalyFlags.HIGH_ENTROPY_SECTION:
+            names.append("HIGH_ENTROPY_SECTION")
         return names if names else ["NONE"]
+
+
+def calculate_entropy(data: bytes) -> float:
+    """
+    Calculate Shannon entropy of data.
+    
+    Returns:
+        Entropy value between 0.0 and 8.0
+    """
+    if not data:
+        return 0.0
+    
+    import math
+    
+    # Count byte occurrences
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    
+    # Calculate entropy
+    entropy = 0.0
+    total = len(data)
+    
+    for count in counts:
+        if count > 0:
+            p = count / total
+            entropy -= p * math.log2(p)
+            
+    return entropy
 
 
 def calculate_imphash(import_table: List[Tuple[str, str]]) -> Optional[str]:
@@ -148,7 +179,7 @@ def extract_pe_sections(layer, base_addr: int) -> List[Dict]:
     
     Returns:
         List of section dictionaries with name, virtual_address, virtual_size,
-        raw_size, characteristics, readable, hash
+        raw_size, characteristics, readable, hash, entropy
     """
     sections = []
     
@@ -191,9 +222,10 @@ def extract_pe_sections(layer, base_addr: int) -> List[Dict]:
             raw_size = struct.unpack('<I', section_data[16:20])[0]
             characteristics = struct.unpack('<I', section_data[36:40])[0]
             
-            # Try to read section data for hashing
+            # Try to read section data for hashing and entropy
             section_va = base_addr + virtual_address
             section_hash = None
+            entropy = 0.0
             is_readable = False
             
             try:
@@ -204,6 +236,7 @@ def extract_pe_sections(layer, base_addr: int) -> List[Dict]:
                 if non_zero > len(section_content) * 0.1:
                     is_readable = True
                     section_hash = hashlib.sha256(section_content).hexdigest()
+                    entropy = calculate_entropy(section_content)
             except:
                 pass
             
@@ -215,6 +248,7 @@ def extract_pe_sections(layer, base_addr: int) -> List[Dict]:
                 'characteristics': characteristics,
                 'readable': is_readable,
                 'hash': section_hash,
+                'entropy': entropy,
                 'is_executable': bool(characteristics & IMAGE_SCN_MEM_EXECUTE),
                 'is_writable': bool(characteristics & IMAGE_SCN_MEM_WRITE),
                 'is_readable_flag': bool(characteristics & IMAGE_SCN_MEM_READ)

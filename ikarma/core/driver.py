@@ -62,6 +62,7 @@ class CapabilityType(Enum):
     # Code Execution
     SHELLCODE_EXECUTION = auto()
     APC_INJECTION = auto()
+    HIDDEN_CODE_EXECUTION = auto()
     
     # Hooking Detection
     MAJOR_FUNCTION_HOOK = auto()

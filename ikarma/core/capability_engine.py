@@ -19,6 +19,10 @@ from ikarma.core.driver import (
     DriverInfo, DriverCapability, IOCTLHandler, CodePattern,
     CapabilityType, ConfidenceLevel,
 )
+from ikarma.core.context_aware_detection import (
+    is_legitimate_msr_access, is_legitimate_cr_access,
+    is_legitimate_port_io, get_context_aware_weight
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,16 +290,19 @@ class CapabilityEngine:
         """Initialize the capability engine."""
         self.architecture = architecture
         self.config = config or {}
-        
+
         # Set up disassembler
         self._disassembler = None
         if HAS_CAPSTONE:
             mode = CS_MODE_64 if architecture == "x64" else CS_MODE_32
             self._disassembler = Cs(CS_ARCH_X86, mode)
             self._disassembler.detail = True
-        
+
         # Build opcode lookup tables for fast matching
         self._build_opcode_tables()
+
+        # Track current driver being analyzed for context-aware detection
+        self._current_driver: Optional[DriverInfo] = None
     
     def _build_opcode_tables(self):
         """Build lookup tables for opcode matching."""
@@ -314,37 +321,69 @@ class CapabilityEngine:
     def analyze_driver(self, driver: DriverInfo, image: bytes) -> List[DriverCapability]:
         """
         Comprehensive capability analysis of a driver.
-        
+
         Args:
             driver: DriverInfo to analyze
             image: Full driver image bytes
-            
+
         Returns:
             List of detected DriverCapability objects
         """
-        capabilities = []
-        
-        # Analyze code in image
-        code_caps = self.analyze_code(image, driver.base_address, "full image")
-        capabilities.extend(code_caps)
-        
-        # Analyze IOCTL handlers specifically
-        for handler in driver.ioctl_handlers:
-            handler_caps = self.analyze_handler(handler)
-            capabilities.extend(handler_caps)
-        
-        # Analyze imports
-        import_caps = self._analyze_imports(image, driver.base_address)
-        capabilities.extend(import_caps)
-        
-        # Analyze strings
-        string_caps = self._analyze_strings(image, driver.base_address)
-        capabilities.extend(string_caps)
-        
-        # Deduplicate
-        capabilities = self._deduplicate_capabilities(capabilities)
-        
-        return capabilities
+        # Set current driver for context-aware detection
+        self._current_driver = driver
+
+        try:
+            capabilities = []
+
+            # Analyze code in executable sections only
+            if HAS_PEFILE:
+                try:
+                    pe = pefile.PE(data=image, fast_load=True)
+                    for section in pe.sections:
+                        # Check for executable characteristics (IMAGE_SCN_MEM_EXECUTE)
+                        if section.Characteristics & 0x20000000:
+                            # Calculate virtual address and size
+                            sect_va = driver.base_address + section.VirtualAddress
+                            sect_data = section.get_data()
+                            sect_name = section.Name.decode('utf-8', errors='ignore').strip('\x00')
+                            
+                            # Analyze this section
+                            sect_caps = self.analyze_code(
+                                sect_data, 
+                                sect_va, 
+                                f"section {sect_name}"
+                            )
+                            capabilities.extend(sect_caps)
+                except Exception as e:
+                    logger.debug(f"PE section parsing failed: {e}")
+                    # Fallback to full image scan if PE parsing fails
+                    code_caps = self.analyze_code(image, driver.base_address, "full image (fallback)")
+                    capabilities.extend(code_caps)
+            else:
+                # Fallback if pefile not available
+                code_caps = self.analyze_code(image, driver.base_address, "full image")
+                capabilities.extend(code_caps)
+
+            # Analyze IOCTL handlers specifically
+            for handler in driver.ioctl_handlers:
+                handler_caps = self.analyze_handler(handler)
+                capabilities.extend(handler_caps)
+
+            # Analyze imports
+            import_caps = self._analyze_imports(image, driver.base_address)
+            capabilities.extend(import_caps)
+
+            # Analyze strings
+            string_caps = self._analyze_strings(image, driver.base_address)
+            capabilities.extend(string_caps)
+
+            # Deduplicate
+            capabilities = self._deduplicate_capabilities(capabilities)
+
+            return capabilities
+        finally:
+            # Clear current driver
+            self._current_driver = None
     
     def analyze_handler(self, handler: IOCTLHandler) -> List[DriverCapability]:
         """Analyze an IOCTL handler for capabilities."""
@@ -379,7 +418,80 @@ class CapabilityEngine:
         if not code:
             return capabilities
         
-        # Scan for dangerous opcodes
+        # Use disassembly-based scanning if available
+        if self._disassembler:
+            return self._scan_with_disassembly(code, base_address, context)
+            
+        # Fallback to raw byte scanning (legacy)
+        return self._scan_raw_bytes(code, base_address, context)
+
+    def _scan_with_disassembly(
+        self,
+        code: bytes,
+        base_address: int,
+        context: str
+    ) -> List[DriverCapability]:
+        """Scan code using disassembly for higher precision."""
+        capabilities = []
+        
+        try:
+            for insn in self._disassembler.disasm(code, base_address):
+                # Check for dangerous opcodes based on mnemonic/bytes
+                cap = self._check_instruction(insn, context)
+                if cap:
+                    capabilities.append(cap)
+        except Exception as e:
+            logger.debug(f"Disassembly failed: {e}")
+            # Fallback to raw scan on failure
+            return self._scan_raw_bytes(code, base_address, context)
+            
+        return capabilities
+
+    def _check_instruction(self, insn, context: str) -> Optional[DriverCapability]:
+        """Check a single instruction for dangerous behavior."""
+        # Check bytes against opcode tables
+        # We check 1, 2, and 3 byte sequences
+        
+        # 3-byte opcodes
+        if len(insn.bytes) >= 3:
+            seq3 = tuple(insn.bytes[:3])
+            if seq3 in self._three_byte_opcodes:
+                cap_name, desc = self._three_byte_opcodes[seq3]
+                return self._create_capability(
+                    cap_name, desc, insn.address,
+                    insn.bytes, context, 0.98 # Higher confidence with disassembly
+                )
+        
+        # 2-byte opcodes
+        if len(insn.bytes) >= 2:
+            seq2 = tuple(insn.bytes[:2])
+            if seq2 in self._two_byte_opcodes:
+                cap_name, desc = self._two_byte_opcodes[seq2]
+                return self._create_capability(
+                    cap_name, desc, insn.address,
+                    insn.bytes, context, 0.96
+                )
+                
+        # 1-byte opcodes
+        if len(insn.bytes) >= 1:
+            opcode = insn.bytes[0]
+            if opcode in self._single_byte_opcodes:
+                cap_name, desc = self._single_byte_opcodes[opcode]
+                return self._create_capability(
+                    cap_name, desc, insn.address,
+                    insn.bytes, context, 0.94
+                )
+                
+        return None
+
+    def _scan_raw_bytes(
+        self,
+        code: bytes,
+        base_address: int,
+        context: str
+    ) -> List[DriverCapability]:
+        """Legacy raw byte scanning (fallback)."""
+        capabilities = []
         i = 0
         while i < len(code):
             cap = None
@@ -391,7 +503,7 @@ class CapabilityEngine:
                     cap_name, desc = self._three_byte_opcodes[seq3]
                     cap = self._create_capability(
                         cap_name, desc, base_address + i,
-                        code[i:i+3], context, 0.95
+                        code[i:i+3], context, 0.85 # Lower confidence without disassembly
                     )
                     i += 3
                     if cap:
@@ -405,7 +517,7 @@ class CapabilityEngine:
                     cap_name, desc = self._two_byte_opcodes[seq2]
                     cap = self._create_capability(
                         cap_name, desc, base_address + i,
-                        code[i:i+2], context, 0.93
+                        code[i:i+2], context, 0.80
                     )
                     i += 2
                     if cap:
@@ -417,7 +529,7 @@ class CapabilityEngine:
                 cap_name, desc = self._single_byte_opcodes[code[i]]
                 cap = self._create_capability(
                     cap_name, desc, base_address + i,
-                    bytes([code[i]]), context, 0.90
+                    bytes([code[i]]), context, 0.75
                 )
                 if cap:
                     capabilities.append(cap)
@@ -491,6 +603,16 @@ class CapabilityEngine:
             if not hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
                 return capabilities
             
+            # First pass: collect all imports to check for validation APIs
+            all_imports = set()
+            for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                for imp in entry.imports:
+                    if imp.name:
+                        all_imports.add(imp.name.decode('utf-8', errors='ignore'))
+
+            # Check for validation APIs
+            has_validation = any(api in all_imports for api in ['ProbeForRead', 'ProbeForWrite', 'MmIsAddressValid'])
+
             for entry in pe.DIRECTORY_ENTRY_IMPORT:
                 dll_name = entry.dll.decode('utf-8', errors='ignore').lower()
                 
@@ -503,13 +625,25 @@ class CapabilityEngine:
                     if func_name in DANGEROUS_APIS:
                         info = DANGEROUS_APIS[func_name]
                         
+                        # Context-aware adjustment for MmMapIoSpace
+                        risk_weight = info["risk_weight"]
+                        confidence = 0.95
+                        
+                        if func_name in ['MmMapIoSpace', 'MmMapIoSpaceEx', 'MmCopyMemory'] and has_validation:
+                            # Lower risk if validation is present
+                            risk_weight -= 2.0
+                            confidence = 0.85
+                            evidence = f"BECAUSE: Import of {func_name} found (with validation APIs present)"
+                        else:
+                            evidence = f"BECAUSE: Import of {func_name} from {dll_name} found in import table"
+                        
                         cap = DriverCapability(
                             capability_type=info["capability"],
-                            confidence=0.95,
+                            confidence=confidence,
                             confidence_level=ConfidenceLevel.HIGH,
                             description=f"Import of {func_name}: {info['description']}",
-                            evidence=f"BECAUSE: Import of {func_name} from {dll_name} found in import table",
-                            risk_weight=info["risk_weight"],
+                            evidence=evidence,
+                            risk_weight=risk_weight,
                             exploitability=info["exploitability"],
                         )
                         capabilities.append(cap)
@@ -592,7 +726,8 @@ class CapabilityEngine:
         return list(seen.values())
     
     def _get_risk_weight(self, cap_type: CapabilityType) -> float:
-        """Get risk weight for a capability type."""
+        """Get context-aware risk weight for a capability type."""
+        # Base weights
         weights = {
             CapabilityType.ARBITRARY_WRITE: 10.0,
             CapabilityType.PHYSICAL_MEMORY_WRITE: 10.0,
@@ -608,7 +743,22 @@ class CapabilityEngine:
             CapabilityType.IDT_MANIPULATION: 7.5,
             CapabilityType.GDT_MANIPULATION: 7.0,
         }
-        return weights.get(cap_type, 5.0)
+        base_weight = weights.get(cap_type, 5.0)
+
+        # Apply context-aware adjustment based on driver legitimacy
+        if self._current_driver and self._current_driver.signature_info:
+            sig = self._current_driver.signature_info
+            adjusted_weight, reason = get_context_aware_weight(
+                base_weight,
+                cap_type.name,
+                sig.is_microsoft_signed,
+                sig.is_whql_signed,
+                sig.is_signed
+            )
+            return adjusted_weight
+
+        # No driver context or signature info - return base weight
+        return base_weight
     
     def _get_exploitability(self, cap_type: CapabilityType) -> str:
         """Get exploitability rating for a capability type."""

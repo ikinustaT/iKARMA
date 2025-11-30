@@ -21,6 +21,7 @@ from ikarma.core.driver import (
 )
 
 from ikarma.core.analyzer import Analyzer
+from ikarma.core.enhanced_analyzer import EnhancedAnalyzer
 from ikarma.core.memory_parser import MemoryParser
 from ikarma.core.capability_engine import CapabilityEngine
 from ikarma.core.antiforensic_detector import AntiForensicDetector
@@ -57,6 +58,7 @@ __all__ = [
 
     # Analyzers
     'Analyzer',
+    'EnhancedAnalyzer',
     'MemoryParser',
     'CapabilityEngine',
     'AntiForensicDetector',

@@ -99,6 +99,18 @@ SIGNER_LEGITIMACY_BONUS = {
 # Hook detection bonus (penalty for hooked drivers)
 HOOK_PENALTY = 3.0
 
+# Known BYOVD Signers - legitimate companies whose certs are abused
+BYOVD_SIGNERS = {
+    "NVIDIA Corporation",
+    "Intel Corporation",
+    "Gigabyte Technology",
+    "Micro-Star International",
+    "ASUSTeK Computer",
+    "Razer USA Ltd",
+    "Patriot Memory",
+    "Universal Audio",
+}
+
 
 # =============================================================================
 # DATA CLASSES
@@ -263,19 +275,23 @@ class RiskScorer:
         return profile
     
     def _score_capabilities(self, driver: DriverInfo) -> Tuple[float, List[RiskFactor]]:
-        """Score based on detected capabilities."""
+        """Score based on detected capabilities using context-aware weights."""
         score = 0.0
         factors = []
-        
+
         for cap in driver.capabilities:
-            weight = CAPABILITY_WEIGHTS.get(cap.capability_type, 3.0)
+            # Use the capability's own risk_weight which is context-aware
+            # (set by CapabilityEngine with legitimacy-based adjustments)
+            weight = cap.risk_weight if hasattr(cap, 'risk_weight') and cap.risk_weight is not None else \
+                     CAPABILITY_WEIGHTS.get(cap.capability_type, 3.0)
+
             contribution = weight * cap.confidence
-            
+
             # Limit contribution from any single capability
             contribution = min(contribution, 5.0)
-            
+
             score += contribution
-            
+
             factors.append(RiskFactor(
                 name=cap.capability_type.name,
                 weight=weight,
@@ -283,12 +299,12 @@ class RiskScorer:
                 because=cap.evidence,
                 category="capability",
             ))
-        
+
         # Normalize capability score contribution
         if driver.capabilities:
             # Average with some boost for having multiple capabilities
             score = (score / len(driver.capabilities)) * min(1 + len(driver.capabilities) * 0.1, 2.0)
-        
+
         return min(score, 8.0), factors
     
     def _score_antiforensics(self, driver: DriverInfo) -> Tuple[float, List[RiskFactor]]:
@@ -403,6 +419,14 @@ class RiskScorer:
         # Check for known trusted signers
         for trusted_signer, bonus in SIGNER_LEGITIMACY_BONUS.items():
             if trusted_signer.lower() in signer.lower():
+                # Check if this signer is also a known BYOVD source
+                is_byovd_signer = any(bs.lower() in signer.lower() for bs in BYOVD_SIGNERS)
+                
+                if is_byovd_signer:
+                    # PENALTY instead of bonus!
+                    # These signers are legitimate but frequently abused
+                    return 1.5 
+                
                 # Cap the bonus
                 return max(bonus, -self.max_legitimacy_bonus)
         
