@@ -7,10 +7,6 @@ kernel APIs in kernel drivers:
   2. String Matching - Fast detection via API name in comments/strings
   3. Call Instruction Analysis - Pattern-based call instruction detection
   4. String Reference Detection - Identifies suspicious string constants
-
-Author: Person 2 (API Hunter)
-Last Updated: 2025-11-25 (Final Iteration - IAT-based detection)
-Integration: Called by plugins/driver_analysis.py and byovd_scanner.py
 """
 
 import re
@@ -29,13 +25,15 @@ try:
         STRING_INDICATORS,
     )
 except Exception:
-    # Fallback to packaged legacy patterns
-    from ikarma.core.api_patterns_v1 import (
-        API_DATABASE,
-        get_all_api_names,
-        get_api_info,
-        STRING_INDICATORS,
-    )
+    # Graceful fallback when API pattern set is unavailable
+    API_DATABASE = {}
+    STRING_INDICATORS = []
+
+    def get_all_api_names():
+        return []
+
+    def get_api_info(_name):
+        return (None, None)
 
 
 # ============================================================================
